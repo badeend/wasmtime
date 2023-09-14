@@ -29,7 +29,13 @@ impl<T: WasiView> tcp::Host for T {
 
         match socket.tcp_state {
             HostTcpState::Default => {}
-            _ => return Err(ErrorCode::NotInProgress.into()),
+            HostTcpState::Bound | HostTcpState::Connected | HostTcpState::Listening => {
+                return Err(ErrorCode::AlreadyBound.into())
+            }
+            HostTcpState::BindStarted
+            | HostTcpState::Connecting
+            | HostTcpState::ConnectReady
+            | HostTcpState::ListenStarted => return Err(ErrorCode::ConcurrencyConflict.into()),
         }
 
         let network = table.get_network(network)?;
@@ -72,8 +78,18 @@ impl<T: WasiView> tcp::Host for T {
 
             match socket.tcp_state {
                 HostTcpState::Default => {}
+                HostTcpState::Bound => {
+                    // Connecting on explicitly bound sockets should be allowed,
+                    // but at the moment Networks can't be checked for equality, so we can't support this
+                    // without introducing a security risk.
+                    return Err(ErrorCode::AlreadyBound.into());
+                }
                 HostTcpState::Connected => return Err(ErrorCode::AlreadyConnected.into()),
-                _ => return Err(ErrorCode::NotInProgress.into()),
+                HostTcpState::Listening => return Err(ErrorCode::AlreadyListening.into()),
+                HostTcpState::Connecting
+                | HostTcpState::ConnectReady
+                | HostTcpState::ListenStarted
+                | HostTcpState::BindStarted => return Err(ErrorCode::ConcurrencyConflict.into()),
             }
 
             let network = table.get_network(network)?;
@@ -153,9 +169,13 @@ impl<T: WasiView> tcp::Host for T {
 
         match socket.tcp_state {
             HostTcpState::Bound => {}
-            HostTcpState::ListenStarted => return Err(ErrorCode::AlreadyListening.into()),
+            HostTcpState::Default => return Err(ErrorCode::NotBound.into()),
             HostTcpState::Connected => return Err(ErrorCode::AlreadyConnected.into()),
-            _ => return Err(ErrorCode::NotInProgress.into()),
+            HostTcpState::Listening => return Err(ErrorCode::AlreadyListening.into()),
+            HostTcpState::ListenStarted
+            | HostTcpState::Connecting
+            | HostTcpState::ConnectReady
+            | HostTcpState::BindStarted => return Err(ErrorCode::ConcurrencyConflict.into()),
         }
 
         socket
@@ -192,7 +212,7 @@ impl<T: WasiView> tcp::Host for T {
         match socket.tcp_state {
             HostTcpState::Listening => {}
             HostTcpState::Connected => return Err(ErrorCode::AlreadyConnected.into()),
-            _ => return Err(ErrorCode::NotInProgress.into()),
+            _ => return Err(ErrorCode::NotListening.into()),
         }
 
         // Do the OS accept call.
