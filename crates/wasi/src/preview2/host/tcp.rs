@@ -211,7 +211,6 @@ impl<T: WasiView> tcp::Host for T {
 
         match socket.tcp_state {
             HostTcpState::Listening => {}
-            HostTcpState::Connected => return Err(ErrorCode::AlreadyConnected.into()),
             _ => return Err(ErrorCode::NotListening.into()),
         }
 
@@ -241,6 +240,15 @@ impl<T: WasiView> tcp::Host for T {
     fn local_address(&mut self, this: tcp::TcpSocket) -> Result<IpSocketAddress, network::Error> {
         let table = self.table();
         let socket = table.get_tcp_socket(this)?;
+
+        match socket.tcp_state {
+            HostTcpState::Bound
+            | HostTcpState::ListenStarted
+            | HostTcpState::Listening
+            | HostTcpState::Connected => {}
+            _ => return Err(ErrorCode::NotBound.into()),
+        }
+
         let addr = socket
             .tcp_socket()
             .as_socketlike_view::<std::net::TcpStream>()
@@ -251,6 +259,12 @@ impl<T: WasiView> tcp::Host for T {
     fn remote_address(&mut self, this: tcp::TcpSocket) -> Result<IpSocketAddress, network::Error> {
         let table = self.table();
         let socket = table.get_tcp_socket(this)?;
+
+        match socket.tcp_state {
+            HostTcpState::Connected => {}
+            _ => return Err(ErrorCode::NotConnected.into()),
+        }
+
         let addr = socket
             .tcp_socket()
             .as_socketlike_view::<std::net::TcpStream>()
@@ -273,12 +287,30 @@ impl<T: WasiView> tcp::Host for T {
     fn ipv6_only(&mut self, this: tcp::TcpSocket) -> Result<bool, network::Error> {
         let table = self.table();
         let socket = table.get_tcp_socket(this)?;
+
+        match socket.address_family {
+            AddressFamily::Ipv6 => {}
+            AddressFamily::Ipv4 => return Err(ErrorCode::Ipv6OnlyOperation.into()),
+        }
+
         Ok(sockopt::get_ipv6_v6only(socket.tcp_socket())?)
     }
 
     fn set_ipv6_only(&mut self, this: tcp::TcpSocket, value: bool) -> Result<(), network::Error> {
         let table = self.table();
         let socket = table.get_tcp_socket(this)?;
+
+        match socket.address_family {
+            AddressFamily::Ipv6 => {}
+            AddressFamily::Ipv4 => return Err(ErrorCode::Ipv6OnlyOperation.into()),
+        }
+
+        match socket.tcp_state {
+            HostTcpState::Default => {}
+            HostTcpState::BindStarted => return Err(ErrorCode::ConcurrencyConflict.into()),
+            _ => return Err(ErrorCode::AlreadyBound.into()),
+        }
+
         Ok(sockopt::set_ipv6_v6only(socket.tcp_socket(), value)?)
     }
 
@@ -437,6 +469,14 @@ impl<T: WasiView> tcp::Host for T {
     ) -> Result<(), network::Error> {
         let table = self.table();
         let socket = table.get_tcp_socket(this)?;
+
+        match socket.tcp_state {
+            HostTcpState::Connected => {}
+            HostTcpState::Connecting | HostTcpState::ConnectReady => {
+                return Err(ErrorCode::ConcurrencyConflict.into())
+            }
+            _ => return Err(ErrorCode::NotConnected.into()),
+        }
 
         let how = match shutdown_type {
             ShutdownType::Receive => std::net::Shutdown::Read,

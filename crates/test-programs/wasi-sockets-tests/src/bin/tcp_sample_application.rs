@@ -1,5 +1,3 @@
-//! A simple TCP testcase, using IPv4.
-
 use wasi::io::streams;
 use wasi::sockets::network::{
     self, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress,
@@ -7,6 +5,7 @@ use wasi::sockets::network::{
 use wasi::sockets::{instance_network, tcp, tcp_create_socket};
 use wasi_sockets_tests::*;
 
+/// A simple end-to-end conversation between a TCP server and client.
 fn test_sample_application(family: IpAddressFamily, bind_address: IpSocketAddress) {
     let first_message = b"Hello, world!";
     let second_message = b"Greetings, planet!";

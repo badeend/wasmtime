@@ -69,3 +69,23 @@ async fn run(name: &str) -> anyhow::Result<()> {
 async fn tcp_sample_application() {
     run("tcp_sample_application").await.unwrap();
 }
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn tcp_unbound_state_invariants() {
+    run("tcp_unbound_state_invariants").await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn tcp_bound_state_invariants() {
+    run("tcp_bound_state_invariants").await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn tcp_listening_state_invariants() {
+    run("tcp_listening_state_invariants").await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn tcp_connected_state_invariants() {
+    run("tcp_connected_state_invariants").await.unwrap();
+}
