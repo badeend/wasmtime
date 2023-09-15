@@ -50,6 +50,9 @@ pub(crate) struct HostTcpSocket {
 
     /// The current state in the bind/listen/accept/connect progression.
     pub(crate) tcp_state: HostTcpState,
+
+    /// Address family of the socket. Used for validations and dispatching functions to the correct socket option.
+    pub(crate) address_family: AddressFamily,
 }
 
 pub(crate) struct TcpReadStream {
@@ -219,25 +222,33 @@ impl HostTcpSocket {
         // Create a new host socket and set it to non-blocking, which is needed
         // by our async implementation.
         let tcp_listener = TcpListener::new(family, Blocking::No)?;
-        Self::from_tcp_listener(tcp_listener)
+        Self::from_tcp_listener(tcp_listener, family, HostTcpState::Default)
     }
 
     /// Create a `HostTcpSocket` from an existing socket.
     ///
     /// The socket must be in non-blocking mode.
-    pub fn from_tcp_stream(tcp_socket: cap_std::net::TcpStream) -> io::Result<Self> {
+    pub(crate) fn from_accepted_tcp_stream(
+        tcp_socket: cap_std::net::TcpStream,
+        family: AddressFamily,
+    ) -> io::Result<Self> {
         let tcp_listener = TcpListener::from(rustix::fd::OwnedFd::from(tcp_socket));
-        Self::from_tcp_listener(tcp_listener)
+        Self::from_tcp_listener(tcp_listener, family, HostTcpState::Connected)
     }
 
-    pub fn from_tcp_listener(tcp_listener: cap_std::net::TcpListener) -> io::Result<Self> {
+    fn from_tcp_listener(
+        tcp_listener: cap_std::net::TcpListener,
+        family: AddressFamily,
+        tcp_state: HostTcpState,
+    ) -> io::Result<Self> {
         let fd = tcp_listener.into_raw_socketlike();
         let std_stream = unsafe { std::net::TcpStream::from_raw_socketlike(fd) };
         let stream = with_ambient_tokio_runtime(|| tokio::net::TcpStream::try_from(std_stream))?;
 
         Ok(Self {
             inner: Arc::new(stream),
-            tcp_state: HostTcpState::Default,
+            tcp_state: tcp_state,
+            address_family: family,
         })
     }
 
