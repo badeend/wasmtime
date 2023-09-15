@@ -17,13 +17,13 @@ impl Subscription {
     }
 
     pub fn wait(&self) {
-    loop {
+        loop {
             let wait = poll::poll_oneoff(&[self.pollable]);
-        if wait[0] {
-            break;
+            if wait[0] {
+                break;
+            }
         }
     }
-}
 }
 
 impl Drop for Subscription {
