@@ -14,8 +14,10 @@ use cap_std::net::TcpListener;
 use io_lifetimes::AsSocketlike;
 use rustix::io::Errno;
 use rustix::net::sockopt;
-use std::any::Any;
+use std::{any::Any, net::SocketAddr};
 use tokio::io::Interest;
+
+use super::network::ErrorExt;
 
 impl<T: WasiView> tcp::Host for T {
     fn start_bind(
@@ -26,11 +28,13 @@ impl<T: WasiView> tcp::Host for T {
     ) -> Result<(), network::Error> {
         let table = self.table_mut();
         let socket = table.get_tcp_socket(this)?;
+        let network = table.get_network(network)?;
+        let local_address: SocketAddr = local_address.into();
 
         match socket.tcp_state {
             HostTcpState::Default => {}
             HostTcpState::Bound | HostTcpState::Connected | HostTcpState::Listening => {
-                return Err(ErrorCode::AlreadyBound.into())
+                return Err(ErrorCode::InvalidState.into())
             }
             HostTcpState::BindStarted
             | HostTcpState::Connecting
@@ -38,13 +42,22 @@ impl<T: WasiView> tcp::Host for T {
             | HostTcpState::ListenStarted => return Err(ErrorCode::ConcurrencyConflict.into()),
         }
 
-        let network = table.get_network(network)?;
+        let local_address_family = AddressFamily::of_socket_addr(local_address);
+        if local_address_family != socket.address_family {
+            return Err(ErrorCode::InvalidArgument.into());
+        }
+
         let binder = network.0.tcp_binder(local_address)?;
 
         // Perform the OS bind call.
-        binder.bind_existing_tcp_listener(
-            &*socket.tcp_socket().as_socketlike_view::<TcpListener>(),
-        )?;
+        binder
+            .bind_existing_tcp_listener(&*socket.tcp_socket().as_socketlike_view::<TcpListener>())
+            .map_err(|error| match error.errno() {
+                Some(Errno::AFNOSUPPORT) => ErrorCode::InvalidArgument.into(),
+                #[cfg(windows)]
+                Some(Errno::NOBUFS) => ErrorCode::AddressInUse.into(), // Windows returns WSAENOBUFS when the ephemeral ports have been exhausted.
+                _ => Into::<network::Error>::into(error),
+            })?;
 
         let socket = table.get_tcp_socket_mut(this)?;
         socket.tcp_state = HostTcpState::BindStarted;
@@ -75,6 +88,8 @@ impl<T: WasiView> tcp::Host for T {
         let table = self.table_mut();
         let r = {
             let socket = table.get_tcp_socket(this)?;
+            let network = table.get_network(network)?;
+            let remote_address: SocketAddr = remote_address.into();
 
             match socket.tcp_state {
                 HostTcpState::Default => {}
@@ -82,17 +97,30 @@ impl<T: WasiView> tcp::Host for T {
                     // Connecting on explicitly bound sockets should be allowed,
                     // but at the moment Networks can't be checked for equality, so we can't support this
                     // without introducing a security risk.
-                    return Err(ErrorCode::AlreadyBound.into());
+                    return Err(ErrorCode::InvalidState.into());
                 }
-                HostTcpState::Connected => return Err(ErrorCode::AlreadyConnected.into()),
-                HostTcpState::Listening => return Err(ErrorCode::AlreadyListening.into()),
+                HostTcpState::Connected | HostTcpState::Listening => {
+                    return Err(ErrorCode::InvalidState.into())
+                }
                 HostTcpState::Connecting
                 | HostTcpState::ConnectReady
                 | HostTcpState::ListenStarted
                 | HostTcpState::BindStarted => return Err(ErrorCode::ConcurrencyConflict.into()),
             }
 
-            let network = table.get_network(network)?;
+            let remote_address_family = AddressFamily::of_socket_addr(remote_address);
+            if remote_address_family != socket.address_family {
+                return Err(ErrorCode::InvalidArgument.into());
+            }
+
+            if remote_address.ip().is_unspecified() {
+                return Err(ErrorCode::InvalidArgument.into());
+            }
+
+            if remote_address.port() == 0 {
+                return Err(ErrorCode::InvalidArgument.into());
+            }
+
             let connecter = network.0.tcp_connecter(remote_address)?;
 
             // Do an OS `connect`. Our socket is non-blocking, so it'll either...
@@ -111,9 +139,21 @@ impl<T: WasiView> tcp::Host for T {
                 return Ok(());
             }
             // continue in progress,
-            Err(err) if err.raw_os_error() == Some(INPROGRESS.raw_os_error()) => {}
+            Err(err) if err.errno() == Some(INPROGRESS) => {}
             // or fail immediately.
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                return Err(match err.errno() {
+                    Some(Errno::AFNOSUPPORT) => ErrorCode::InvalidArgument.into(),
+                    #[cfg(windows)]
+                    Some(Errno::ADDRNOTAVAIL) => ErrorCode::InvalidArgument.into(),
+                    #[cfg(not(windows))]
+                    Some(Errno::ADDRNOTAVAIL) | Some(Errno::AGAIN) => {
+                        // Ephemeral ports exhausted.
+                        ErrorCode::AddressInUse.into()
+                    }
+                    _ => Into::<network::Error>::into(err),
+                });
+            }
         }
 
         let socket = table.get_tcp_socket_mut(this)?;
@@ -169,9 +209,9 @@ impl<T: WasiView> tcp::Host for T {
 
         match socket.tcp_state {
             HostTcpState::Bound => {}
-            HostTcpState::Default => return Err(ErrorCode::NotBound.into()),
-            HostTcpState::Connected => return Err(ErrorCode::AlreadyConnected.into()),
-            HostTcpState::Listening => return Err(ErrorCode::AlreadyListening.into()),
+            HostTcpState::Default | HostTcpState::Connected | HostTcpState::Listening => {
+                return Err(ErrorCode::InvalidState.into())
+            }
             HostTcpState::ListenStarted
             | HostTcpState::Connecting
             | HostTcpState::ConnectReady
@@ -181,7 +221,15 @@ impl<T: WasiView> tcp::Host for T {
         socket
             .tcp_socket()
             .as_socketlike_view::<TcpListener>()
-            .listen(None)?;
+            .listen(None)
+            .map_err(|error| match error.errno() {
+                Some(Errno::DESTADDRREQ) => ErrorCode::InvalidState.into(), // Not bound (POSIX)
+                Some(Errno::INVAL) => ErrorCode::InvalidState.into(), // Already connected (POSIX), Not bound (Windows)
+
+                #[cfg(windows)]
+                Some(Errno::MFILE) => ErrorCode::OutOfMemory.into(), // We're not trying to create a new socket. Rewrite it to less surprising error code.
+                _ => Into::<network::Error>::into(error),
+            })?;
 
         socket.tcp_state = HostTcpState::ListenStarted;
 
@@ -211,16 +259,48 @@ impl<T: WasiView> tcp::Host for T {
 
         match socket.tcp_state {
             HostTcpState::Listening => {}
-            _ => return Err(ErrorCode::NotListening.into()),
+            _ => return Err(ErrorCode::InvalidState.into()),
         }
 
         // Do the OS accept call.
         let tcp_socket = socket.tcp_socket();
-        let (connection, _addr) = tcp_socket.try_io(Interest::READABLE, || {
-            tcp_socket
-                .as_socketlike_view::<TcpListener>()
-                .accept_with(Blocking::No)
-        })?;
+        let (connection, _addr) = tcp_socket
+            .try_io(Interest::READABLE, || {
+                tcp_socket
+                    .as_socketlike_view::<TcpListener>()
+                    .accept_with(Blocking::No)
+            })
+            .map_err(|error| match error.errno() {
+                Some(Errno::INVAL) => ErrorCode::InvalidState.into(), // Not listening
+                #[cfg(windows)]
+                Some(Errno::INPROGRESS) => ErrorCode::WouldBlock.into(), // "A blocking Windows Sockets 1.1 call is in progress, or the service provider is still processing a callback function.""
+
+                // Skip over transient errors.
+                // https://github.com/WebAssembly/wasi-sockets/pull/18/files#r1120716442
+                // Due to Linux' non-standard behavior, this is quite a list.
+                Some(
+                    Errno::CONNABORTED
+                    | Errno::CONNRESET
+                    | Errno::NETRESET
+                    | Errno::HOSTUNREACH
+                    | Errno::HOSTDOWN
+                    | Errno::NETDOWN
+                    | Errno::NETUNREACH
+                    | Errno::PROTO
+                    | Errno::NOPROTOOPT
+                    | Errno::NONET
+                    | Errno::OPNOTSUPP,
+                ) => ErrorCode::WouldBlock.into(),
+                Some(Errno::NOMEM | Errno::NOBUFS | Errno::MFILE | Errno::NFILE) => {
+                    // FIXME: technically these are transient.
+                    // We should return WouldBlock, but the socket remains immediately readable,
+                    // so to prevent applications ending up in a spin loop:
+                    ErrorCode::OutOfMemory.into()
+                }
+
+                _ => Into::<network::Error>::into(error),
+            })?;
+
         let tcp_socket =
             HostTcpSocket::from_accepted_tcp_stream(connection, socket.address_family)?;
 
@@ -246,7 +326,7 @@ impl<T: WasiView> tcp::Host for T {
             | HostTcpState::ListenStarted
             | HostTcpState::Listening
             | HostTcpState::Connected => {}
-            _ => return Err(ErrorCode::NotBound.into()),
+            _ => return Err(ErrorCode::InvalidState.into()),
         }
 
         let addr = socket
@@ -262,7 +342,7 @@ impl<T: WasiView> tcp::Host for T {
 
         match socket.tcp_state {
             HostTcpState::Connected => {}
-            _ => return Err(ErrorCode::NotConnected.into()),
+            _ => return Err(ErrorCode::InvalidState.into()),
         }
 
         let addr = socket
@@ -290,7 +370,7 @@ impl<T: WasiView> tcp::Host for T {
 
         match socket.address_family {
             AddressFamily::Ipv6 => {}
-            AddressFamily::Ipv4 => return Err(ErrorCode::Ipv6OnlyOperation.into()),
+            AddressFamily::Ipv4 => return Err(ErrorCode::NotSupported.into()),
         }
 
         Ok(sockopt::get_ipv6_v6only(socket.tcp_socket())?)
@@ -302,13 +382,13 @@ impl<T: WasiView> tcp::Host for T {
 
         match socket.address_family {
             AddressFamily::Ipv6 => {}
-            AddressFamily::Ipv4 => return Err(ErrorCode::Ipv6OnlyOperation.into()),
+            AddressFamily::Ipv4 => return Err(ErrorCode::NotSupported.into()),
         }
 
         match socket.tcp_state {
             HostTcpState::Default => {}
             HostTcpState::BindStarted => return Err(ErrorCode::ConcurrencyConflict.into()),
-            _ => return Err(ErrorCode::AlreadyBound.into()),
+            _ => return Err(ErrorCode::InvalidState.into()),
         }
 
         Ok(sockopt::set_ipv6_v6only(socket.tcp_socket(), value)?)
@@ -475,7 +555,7 @@ impl<T: WasiView> tcp::Host for T {
             HostTcpState::Connecting | HostTcpState::ConnectReady => {
                 return Err(ErrorCode::ConcurrencyConflict.into())
             }
-            _ => return Err(ErrorCode::NotConnected.into()),
+            _ => return Err(ErrorCode::InvalidState.into()),
         }
 
         let how = match shutdown_type {

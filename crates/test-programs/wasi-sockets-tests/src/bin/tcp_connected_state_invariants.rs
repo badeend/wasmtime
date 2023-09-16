@@ -16,7 +16,7 @@ fn test_tcp_connected_state_invariants(net: tcp::Network, family: IpAddressFamil
 
     assert!(matches!(
         tcp::start_bind(sock.fd, net, bind_address),
-        Err(ErrorCode::AlreadyBound)
+        Err(ErrorCode::InvalidState)
     ));
     assert!(matches!(
         tcp::finish_bind(sock.fd),
@@ -24,7 +24,7 @@ fn test_tcp_connected_state_invariants(net: tcp::Network, family: IpAddressFamil
     ));
     assert!(matches!(
         tcp::start_connect(sock.fd, net, addr_listener),
-        Err(ErrorCode::AlreadyConnected)
+        Err(ErrorCode::InvalidState)
     ));
     assert!(matches!(
         tcp::finish_connect(sock.fd),
@@ -32,13 +32,13 @@ fn test_tcp_connected_state_invariants(net: tcp::Network, family: IpAddressFamil
     ));
     assert!(matches!(
         tcp::start_listen(sock.fd),
-        Err(ErrorCode::AlreadyConnected)
+        Err(ErrorCode::InvalidState)
     ));
     assert!(matches!(
         tcp::finish_listen(sock.fd),
         Err(ErrorCode::NotInProgress)
     ));
-    assert!(matches!(tcp::accept(sock.fd), Err(ErrorCode::NotListening)));
+    assert!(matches!(tcp::accept(sock.fd), Err(ErrorCode::InvalidState)));
     // Skipping: tcp::shutdown
 
     assert!(matches!(tcp::local_address(sock.fd), Ok(_)));
@@ -49,16 +49,16 @@ fn test_tcp_connected_state_invariants(net: tcp::Network, family: IpAddressFamil
         assert!(matches!(tcp::ipv6_only(sock.fd), Ok(_)));
         assert!(matches!(
             tcp::set_ipv6_only(sock.fd, true),
-            Err(ErrorCode::AlreadyBound)
+            Err(ErrorCode::InvalidState)
         ));
     } else {
         assert!(matches!(
             tcp::ipv6_only(sock.fd),
-            Err(ErrorCode::Ipv6OnlyOperation)
+            Err(ErrorCode::NotSupported)
         ));
         assert!(matches!(
             tcp::set_ipv6_only(sock.fd, true),
-            Err(ErrorCode::Ipv6OnlyOperation)
+            Err(ErrorCode::NotSupported)
         ));
     }
 

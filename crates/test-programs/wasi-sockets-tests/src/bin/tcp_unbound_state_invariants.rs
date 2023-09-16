@@ -17,39 +17,42 @@ fn test_tcp_unbound_state_invariants(family: IpAddressFamily) {
     ));
     assert!(matches!(
         tcp::start_listen(sock.fd),
-        Err(ErrorCode::NotBound)
+        Err(ErrorCode::InvalidState) // In WASI, unlike POSIX, trying to listen without an explicit bind should fail.
     ));
     assert!(matches!(
         tcp::finish_listen(sock.fd),
         Err(ErrorCode::NotInProgress)
     ));
-    assert!(matches!(tcp::accept(sock.fd), Err(ErrorCode::NotListening)));
+    assert!(matches!(tcp::accept(sock.fd), Err(ErrorCode::InvalidState)));
     assert!(matches!(
         tcp::shutdown(sock.fd, tcp::ShutdownType::Both),
-        Err(ErrorCode::NotConnected)
+        Err(ErrorCode::InvalidState)
     ));
 
     assert!(matches!(
         tcp::local_address(sock.fd),
-        Err(ErrorCode::NotBound)
+        Err(ErrorCode::InvalidState)
     ));
     assert!(matches!(
         tcp::remote_address(sock.fd),
-        Err(ErrorCode::NotConnected)
+        Err(ErrorCode::InvalidState)
     ));
     assert_eq!(tcp::address_family(sock.fd), family);
 
     if family == IpAddressFamily::Ipv6 {
         assert!(matches!(tcp::ipv6_only(sock.fd), Ok(_)));
+        
+        // Even on platforms that don't support dualstack sockets,
+        // setting ipv6_only to true (disabling dualstack mode) should work.
         assert!(matches!(tcp::set_ipv6_only(sock.fd, true), Ok(_)));
     } else {
         assert!(matches!(
             tcp::ipv6_only(sock.fd),
-            Err(ErrorCode::Ipv6OnlyOperation)
+            Err(ErrorCode::NotSupported)
         ));
         assert!(matches!(
             tcp::set_ipv6_only(sock.fd, true),
-            Err(ErrorCode::Ipv6OnlyOperation)
+            Err(ErrorCode::NotSupported)
         ));
     }
 

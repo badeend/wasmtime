@@ -10,7 +10,7 @@ fn test_tcp_listening_state_invariants(net: tcp::Network, family: IpAddressFamil
 
     assert!(matches!(
         tcp::start_bind(sock.fd, net, bind_address),
-        Err(ErrorCode::AlreadyBound)
+        Err(ErrorCode::InvalidState)
     ));
     assert!(matches!(
         tcp::finish_bind(sock.fd),
@@ -18,7 +18,7 @@ fn test_tcp_listening_state_invariants(net: tcp::Network, family: IpAddressFamil
     ));
     assert!(matches!(
         tcp::start_connect(sock.fd, net, bind_address), // Actual address shouldn't matter
-        Err(ErrorCode::AlreadyListening)
+        Err(ErrorCode::InvalidState)
     ));
     assert!(matches!(
         tcp::finish_connect(sock.fd),
@@ -26,7 +26,7 @@ fn test_tcp_listening_state_invariants(net: tcp::Network, family: IpAddressFamil
     ));
     assert!(matches!(
         tcp::start_listen(sock.fd),
-        Err(ErrorCode::AlreadyListening)
+        Err(ErrorCode::InvalidState)
     ));
     assert!(matches!(
         tcp::finish_listen(sock.fd),
@@ -35,13 +35,13 @@ fn test_tcp_listening_state_invariants(net: tcp::Network, family: IpAddressFamil
     // Skipping: tcp::accept
     assert!(matches!(
         tcp::shutdown(sock.fd, tcp::ShutdownType::Both),
-        Err(ErrorCode::NotConnected)
+        Err(ErrorCode::InvalidState)
     ));
 
     assert!(matches!(tcp::local_address(sock.fd), Ok(_)));
     assert!(matches!(
         tcp::remote_address(sock.fd),
-        Err(ErrorCode::NotConnected)
+        Err(ErrorCode::InvalidState)
     ));
     assert_eq!(tcp::address_family(sock.fd), family);
 
@@ -49,16 +49,16 @@ fn test_tcp_listening_state_invariants(net: tcp::Network, family: IpAddressFamil
         assert!(matches!(tcp::ipv6_only(sock.fd), Ok(_)));
         assert!(matches!(
             tcp::set_ipv6_only(sock.fd, true),
-            Err(ErrorCode::AlreadyBound)
+            Err(ErrorCode::InvalidState)
         ));
     } else {
         assert!(matches!(
             tcp::ipv6_only(sock.fd),
-            Err(ErrorCode::Ipv6OnlyOperation)
+            Err(ErrorCode::NotSupported)
         ));
         assert!(matches!(
             tcp::set_ipv6_only(sock.fd, true),
-            Err(ErrorCode::Ipv6OnlyOperation)
+            Err(ErrorCode::NotSupported)
         ));
     }
 
