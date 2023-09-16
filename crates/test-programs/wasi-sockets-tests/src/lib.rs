@@ -2,10 +2,11 @@ wit_bindgen::generate!("test-command-with-sockets" in "../../wasi/wit");
 
 use wasi::io::streams::{self, InputStream, OutputStream};
 use wasi::poll::poll;
-use wasi::sockets::{
-    network::{ErrorCode, IpSocketAddress},
-    tcp::{self, TcpSocket},
+use wasi::sockets::network::{
+    ErrorCode, IpAddress, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress,
 };
+use wasi::sockets::tcp;
+use wasi::sockets::tcp_create_socket;
 
 pub struct Subscription {
     pollable: poll::Pollable,
@@ -66,48 +67,140 @@ pub fn write(output: streams::OutputStream, mut bytes: &[u8]) -> (usize, streams
     (total, streams::StreamStatus::Open)
 }
 
-pub fn tcp_blocking_bind(
-    socket: u32,
-    network: u32,
-    local_address: IpSocketAddress,
-) -> Result<(), ErrorCode> {
-    let s = Subscription::new(tcp::subscribe(socket));
-
-    tcp::start_bind(socket, network, local_address)?;
-    s.wait();
-    tcp::finish_bind(socket)
+pub struct TcpSock {
+    pub fd: tcp::TcpSocket,
 }
 
-pub fn tcp_blocking_listen(socket: u32) -> Result<(), ErrorCode> {
-    let s = Subscription::new(tcp::subscribe(socket));
+impl TcpSock {
+    pub fn new(address_family: IpAddressFamily) -> Result<TcpSock, ErrorCode> {
+        Ok(TcpSock {
+            fd: tcp_create_socket::create_tcp_socket(address_family)?,
+        })
+    }
 
-    tcp::start_listen(socket)?;
-    s.wait();
-    tcp::finish_listen(socket)
+    pub fn bind(&self, network: u32, local_address: IpSocketAddress) -> Result<(), ErrorCode> {
+        let sub = Subscription::new(tcp::subscribe(self.fd));
+
+        tcp::start_bind(self.fd, network, local_address)?;
+        sub.wait();
+        tcp::finish_bind(self.fd)
+    }
+
+    pub fn listen(&self) -> Result<(), ErrorCode> {
+        let sub = Subscription::new(tcp::subscribe(self.fd));
+
+        tcp::start_listen(self.fd)?;
+        sub.wait();
+        tcp::finish_listen(self.fd)
+    }
+
+    pub fn connect(
+        &self,
+        network: u32,
+        remote_address: IpSocketAddress,
+    ) -> Result<(InputStream, OutputStream), ErrorCode> {
+        let sub = Subscription::new(tcp::subscribe(self.fd));
+
+        tcp::start_connect(self.fd, network, remote_address)?;
+        sub.wait();
+        tcp::finish_connect(self.fd)
+    }
+
+    pub fn accept(&self) -> Result<(TcpSock, InputStream, OutputStream), ErrorCode> {
+        let sub = Subscription::new(tcp::subscribe(self.fd));
+
+        loop {
+            match tcp::accept(self.fd) {
+                Err(ErrorCode::WouldBlock) => sub.wait(),
+                Err(e) => return Err(e),
+                Ok((s, i, o)) => return Ok((TcpSock { fd: s }, i, o)),
+            }
+        }
+    }
 }
 
-pub fn tcp_blocking_connect(
-    socket: u32,
-    network: u32,
-    remote_address: IpSocketAddress,
-) -> Result<(InputStream, OutputStream), ErrorCode> {
-    let s = Subscription::new(tcp::subscribe(socket));
-
-    tcp::start_connect(socket, network, remote_address)?;
-    s.wait();
-    tcp::finish_connect(socket)
+impl Drop for TcpSock {
+    fn drop(&mut self) {
+        tcp::drop_tcp_socket(self.fd);
+    }
 }
 
-pub fn tcp_blocking_accept(
-    socket: u32,
-) -> Result<(TcpSocket, InputStream, OutputStream), ErrorCode> {
-    let s = Subscription::new(tcp::subscribe(socket));
+impl Eq for IpAddress {}
+impl PartialEq for IpAddress {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ipv4(l0), Self::Ipv4(r0)) => l0 == r0,
+            (Self::Ipv6(l0), Self::Ipv6(r0)) => l0 == r0,
+            _ => false,
+        }
+    }
+}
 
-    loop {
-        match tcp::accept(socket) {
-            Err(ErrorCode::WouldBlock) => s.wait(),
-            Err(e) => return Err(e),
-            Ok(r) => return Ok(r),
+impl IpAddress {
+    pub const IPV4_LOOPBACK: IpAddress = IpAddress::Ipv4((127, 0, 0, 1));
+    pub const IPV6_LOOPBACK: IpAddress = IpAddress::Ipv6((0, 0, 0, 0, 0, 0, 0, 1));
+
+    pub const IPV4_UNSPECIFIED: IpAddress = IpAddress::Ipv4((0, 0, 0, 0));
+    pub const IPV6_UNSPECIFIED: IpAddress = IpAddress::Ipv6((0, 0, 0, 0, 0, 0, 0, 0));
+
+    pub const IPV4_MAPPED_LOOPBACK: IpAddress = IpAddress::Ipv6((0, 0, 0, 0, 0, 0xFFFF, 0x7F00, 0x0001));
+
+    pub const fn new_loopback(family: IpAddressFamily) -> IpAddress {
+        match family {
+            IpAddressFamily::Ipv4 => Self::IPV4_LOOPBACK,
+            IpAddressFamily::Ipv6 => Self::IPV6_LOOPBACK,
+        }
+    }
+
+    pub const fn new_unspecified(family: IpAddressFamily) -> IpAddress {
+        match family {
+            IpAddressFamily::Ipv4 => Self::IPV4_UNSPECIFIED,
+            IpAddressFamily::Ipv6 => Self::IPV6_UNSPECIFIED,
+        }
+    }
+
+    pub const fn family(&self) -> IpAddressFamily {
+        match self {
+            IpAddress::Ipv4(_) => IpAddressFamily::Ipv4,
+            IpAddress::Ipv6(_) => IpAddressFamily::Ipv6,
+        }
+    }
+}
+
+impl IpSocketAddress {
+    pub const fn new(ip: IpAddress, port: u16) -> IpSocketAddress {
+        match ip {
+            IpAddress::Ipv4(addr) => IpSocketAddress::Ipv4(Ipv4SocketAddress {
+                port: port,
+                address: addr,
+            }),
+            IpAddress::Ipv6(addr) => IpSocketAddress::Ipv6(Ipv6SocketAddress {
+                port: port,
+                address: addr,
+                flow_info: 0,
+                scope_id: 0,
+            }),
+        }
+    }
+
+    pub const fn ip(&self) -> IpAddress {
+        match self {
+            IpSocketAddress::Ipv4(addr) => IpAddress::Ipv4(addr.address),
+            IpSocketAddress::Ipv6(addr) => IpAddress::Ipv6(addr.address),
+        }
+    }
+
+    pub const fn port(&self) -> u16 {
+        match self {
+            IpSocketAddress::Ipv4(addr) => addr.port,
+            IpSocketAddress::Ipv6(addr) => addr.port,
+        }
+    }
+
+    pub const fn family(&self) -> IpAddressFamily {
+        match self {
+            IpSocketAddress::Ipv4(_) => IpAddressFamily::Ipv4,
+            IpSocketAddress::Ipv6(_) => IpAddressFamily::Ipv6,
         }
     }
 }
