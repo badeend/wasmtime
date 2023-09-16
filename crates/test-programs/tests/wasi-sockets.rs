@@ -89,3 +89,18 @@ async fn tcp_listening_state_invariants() {
 async fn tcp_connected_state_invariants() {
     run("tcp_connected_state_invariants").await.unwrap();
 }
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn tcp_bind() {
+    run("tcp_bind").await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn tcp_listen() {
+    run("tcp_listen").await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn tcp_accept() {
+    run("tcp_accept").await.unwrap();
+}
