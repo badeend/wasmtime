@@ -33,9 +33,10 @@ impl<T: WasiView> tcp::Host for T {
 
         match socket.tcp_state {
             HostTcpState::Default => {}
-            HostTcpState::Bound | HostTcpState::Connected | HostTcpState::Listening => {
-                return Err(ErrorCode::InvalidState.into())
-            }
+            HostTcpState::Bound
+            | HostTcpState::Connected
+            | HostTcpState::ConnectFailed
+            | HostTcpState::Listening => return Err(ErrorCode::InvalidState.into()),
             HostTcpState::BindStarted
             | HostTcpState::Connecting
             | HostTcpState::ConnectReady
@@ -99,7 +100,7 @@ impl<T: WasiView> tcp::Host for T {
                     // without introducing a security risk.
                     return Err(ErrorCode::InvalidState.into());
                 }
-                HostTcpState::Connected | HostTcpState::Listening => {
+                HostTcpState::Connected | HostTcpState::ConnectFailed | HostTcpState::Listening => {
                     return Err(ErrorCode::InvalidState.into())
                 }
                 HostTcpState::Connecting
@@ -142,6 +143,9 @@ impl<T: WasiView> tcp::Host for T {
             Err(err) if err.errno() == Some(INPROGRESS) => {}
             // or fail immediately.
             Err(err) => {
+                let socket = table.get_tcp_socket_mut(this)?;
+                socket.tcp_state = HostTcpState::ConnectFailed;
+
                 return Err(match err.errno() {
                     Some(Errno::AFNOSUPPORT) => ErrorCode::InvalidArgument.into(),
                     #[cfg(windows)]
@@ -189,7 +193,10 @@ impl<T: WasiView> tcp::Host for T {
                 // Check whether the connect succeeded.
                 match sockopt::get_socket_error(socket.tcp_socket()) {
                     Ok(Ok(())) => {}
-                    Err(err) | Ok(Err(err)) => return Err(err.into()),
+                    Err(err) | Ok(Err(err)) => {
+                        socket.tcp_state = HostTcpState::ConnectFailed;
+                        return Err(err.into());
+                    }
                 }
             }
             _ => return Err(ErrorCode::NotInProgress.into()),
@@ -209,9 +216,10 @@ impl<T: WasiView> tcp::Host for T {
 
         match socket.tcp_state {
             HostTcpState::Bound => {}
-            HostTcpState::Default | HostTcpState::Connected | HostTcpState::Listening => {
-                return Err(ErrorCode::InvalidState.into())
-            }
+            HostTcpState::Default
+            | HostTcpState::Connected
+            | HostTcpState::ConnectFailed
+            | HostTcpState::Listening => return Err(ErrorCode::InvalidState.into()),
             HostTcpState::ListenStarted
             | HostTcpState::Connecting
             | HostTcpState::ConnectReady

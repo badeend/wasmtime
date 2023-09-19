@@ -35,6 +35,9 @@ pub(crate) enum HostTcpState {
     /// An outgoing connection is ready to be established.
     ConnectReady,
 
+    /// A connection attempt failed. The socket is now unusable.
+    ConnectFailed,
+
     /// An outgoing connection has been established.
     Connected,
 }
