@@ -82,16 +82,26 @@ impl TcpSock {
         let sub = Subscription::new(tcp::subscribe(self.fd));
 
         tcp::start_bind(self.fd, network, local_address)?;
-        sub.wait();
-        tcp::finish_bind(self.fd)
+
+        loop {
+            match tcp::finish_bind(self.fd) {
+                Err(ErrorCode::WouldBlock) => sub.wait(),
+                result => return result,
+            }
+        }
     }
 
     pub fn listen(&self) -> Result<(), ErrorCode> {
         let sub = Subscription::new(tcp::subscribe(self.fd));
 
         tcp::start_listen(self.fd)?;
-        sub.wait();
-        tcp::finish_listen(self.fd)
+
+        loop {
+            match tcp::finish_listen(self.fd) {
+                Err(ErrorCode::WouldBlock) => sub.wait(),
+                result => return result,
+            }
+        }
     }
 
     pub fn connect(
@@ -102,8 +112,13 @@ impl TcpSock {
         let sub = Subscription::new(tcp::subscribe(self.fd));
 
         tcp::start_connect(self.fd, network, remote_address)?;
-        sub.wait();
-        tcp::finish_connect(self.fd)
+
+        loop {
+            match tcp::finish_connect(self.fd) {
+                Err(ErrorCode::WouldBlock) => sub.wait(),
+                result => return result,
+            }
+        }
     }
 
     pub fn accept(&self) -> Result<(TcpSock, InputStream, OutputStream), ErrorCode> {
@@ -143,7 +158,8 @@ impl IpAddress {
     pub const IPV4_UNSPECIFIED: IpAddress = IpAddress::Ipv4((0, 0, 0, 0));
     pub const IPV6_UNSPECIFIED: IpAddress = IpAddress::Ipv6((0, 0, 0, 0, 0, 0, 0, 0));
 
-    pub const IPV4_MAPPED_LOOPBACK: IpAddress = IpAddress::Ipv6((0, 0, 0, 0, 0, 0xFFFF, 0x7F00, 0x0001));
+    pub const IPV4_MAPPED_LOOPBACK: IpAddress =
+        IpAddress::Ipv6((0, 0, 0, 0, 0, 0xFFFF, 0x7F00, 0x0001));
 
     pub const fn new_loopback(family: IpAddressFamily) -> IpAddress {
         match family {
