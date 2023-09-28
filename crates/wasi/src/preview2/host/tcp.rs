@@ -36,7 +36,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         }
 
         let network = table.get_network(&network)?;
-        let binder = network.0.tcp_binder(local_address)?;
+        let binder = network.pool.tcp_binder(local_address)?;
 
         // Perform the OS bind call.
         binder.bind_existing_tcp_listener(
@@ -80,7 +80,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
             }
 
             let network = table.get_network(&network)?;
-            let connecter = network.0.tcp_connecter(remote_address)?;
+            let connecter = network.pool.tcp_connecter(remote_address)?;
 
             // Do an OS `connect`. Our socket is non-blocking, so it'll either...
             {

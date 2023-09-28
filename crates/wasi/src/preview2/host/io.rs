@@ -10,9 +10,6 @@ use crate::preview2::{
     HostPollable, TableError, TablePollableExt, WasiView,
 };
 use std::any::Any;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use wasmtime::component::Resource;
 
 impl From<StreamState> for streams::StreamStatus {
@@ -55,11 +52,10 @@ impl<T: WasiView> streams::HostOutputStream for T {
     fn check_write(&mut self, stream: Resource<OutputStream>) -> Result<u64, streams::Error> {
         let s = self.table_mut().get_output_stream_mut(&stream)?;
         let mut ready = s.write_ready();
-        let mut task = Context::from_waker(futures::task::noop_waker_ref());
-        match Pin::new(&mut ready).poll(&mut task) {
-            Poll::Ready(Ok(permit)) => Ok(permit as u64),
-            Poll::Ready(Err(e)) => Err(e.into()),
-            Poll::Pending => Ok(0),
+        match crate::preview2::poll_noop(&mut ready) {
+            Some(Ok(permit)) => Ok(permit as u64),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(0),
         }
     }
 

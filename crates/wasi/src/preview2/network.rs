@@ -3,12 +3,9 @@ use crate::preview2::{Table, TableError};
 use cap_std::net::Pool;
 use wasmtime::component::Resource;
 
-pub(crate) struct HostNetworkState(pub(crate) Pool);
-
-impl HostNetworkState {
-    pub fn new(pool: Pool) -> Self {
-        Self(pool)
-    }
+pub struct HostNetworkState {
+    pub pool: Pool,
+    pub allow_ip_name_lookup: bool,
 }
 
 pub(crate) trait TableNetworkExt {

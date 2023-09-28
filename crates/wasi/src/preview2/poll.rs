@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use wasmtime::component::Resource;
 
 pub type PollableFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-pub type MakeFuture = for<'a> fn(&'a mut dyn Any) -> PollableFuture<'a>;
+pub type MakeFuture = fn(&mut dyn Any) -> PollableFuture<'_>;
 pub type ClosureFuture = Box<dyn Fn() -> PollableFuture<'static> + Send + Sync + 'static>;
 
 /// A host representation of the `wasi:io/poll.pollable` resource.
@@ -38,6 +38,24 @@ pub trait TablePollableExt {
         fd: &Resource<Pollable>,
     ) -> Result<&mut HostPollable, TableError>;
     fn delete_host_pollable(&mut self, fd: Resource<Pollable>) -> Result<HostPollable, TableError>;
+
+    fn push_host_pollable_resource<T: Subscribe>(
+        &mut self,
+        resource: &Resource<T>,
+    ) -> Result<Resource<Pollable>, TableError> {
+        fn make_future<T: Subscribe>(slot: &mut dyn Any) -> PollableFuture<'_> {
+            slot.downcast_mut::<T>().unwrap().ready()
+        }
+        Ok(self.push_host_pollable(HostPollable::TableEntry {
+            index: resource.rep(),
+            make_future: make_future::<T>,
+        })?)
+    }
+}
+
+#[async_trait::async_trait]
+pub trait Subscribe: 'static {
+    async fn ready(&mut self) -> Result<()>;
 }
 
 impl TablePollableExt for Table {
