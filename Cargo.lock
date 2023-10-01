@@ -3760,6 +3760,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "wasi-cap-std-sync",
  "wasi-common",
  "wasi-tokio",
