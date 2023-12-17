@@ -7,7 +7,7 @@ use wasmtime::{
 use wasmtime_wasi::preview2::{
     pipe::MemoryOutputPipe,
     preview1::{WasiPreview1Adapter, WasiPreview1View},
-    DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiView,
+    DirPerms, FilePerms, SocketAddrUse, WasiCtx, WasiCtxBuilder, WasiTcpView, WasiView,
 };
 
 struct Ctx {
@@ -30,6 +30,20 @@ impl WasiView for Ctx {
     }
     fn ctx_mut(&mut self) -> &mut WasiCtx {
         &mut self.wasi
+    }
+}
+
+impl WasiTcpView for Ctx {
+    fn check_tcp_addr(
+        &mut self,
+        addr: &std::net::SocketAddr,
+        reason: SocketAddrUse,
+    ) -> std::io::Result<()> {
+        Ok(()) // Everything allowed in the tests
+    }
+
+    fn check_allowed_tcp(&mut self) -> std::io::Result<()> {
+        Ok(()) // Everything allowed in the tests
     }
 }
 

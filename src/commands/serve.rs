@@ -11,7 +11,7 @@ use std::{
 };
 use wasmtime::component::{InstancePre, Linker};
 use wasmtime::{Engine, Store, StoreLimits};
-use wasmtime_wasi::preview2::{self, StreamError, StreamResult, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::preview2::{self, StreamError, StreamResult, WasiCtx, WasiCtxBuilder, WasiView, WasiTcpView};
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::{
     bindings::http::types as http_types, body::HyperOutgoingBody, hyper_response_error,
@@ -48,6 +48,10 @@ impl WasiView for Host {
     fn ctx_mut(&mut self) -> &mut WasiCtx {
         &mut self.ctx
     }
+}
+
+impl WasiTcpView for Host {
+    // TODO
 }
 
 impl WasiHttpView for Host {

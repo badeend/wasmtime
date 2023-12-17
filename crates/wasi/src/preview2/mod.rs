@@ -41,10 +41,10 @@ mod udp;
 mod write_stream;
 
 pub use self::clocks::{HostMonotonicClock, HostWallClock};
-pub use self::ctx::{WasiCtx, WasiCtxBuilder, WasiView};
+pub use self::ctx::{WasiCtx, WasiCtxBuilder, WasiTcpView, WasiView};
 pub use self::error::{I32Exit, TrappableError};
 pub use self::filesystem::{DirPerms, FilePerms, FsError, FsResult};
-pub use self::network::{Network, SocketError, SocketResult};
+pub use self::network::{Network, SocketAddrUse, SocketError, SocketResult};
 pub use self::poll::{subscribe, ClosureFuture, MakeFuture, Pollable, PollableFuture, Subscribe};
 pub use self::random::{thread_rng, Deterministic};
 pub use self::stdio::{

@@ -11,7 +11,7 @@ use wasmtime::{
     component::{Component, Linker, Resource, ResourceTable},
     Config, Engine, Store,
 };
-use wasmtime_wasi::preview2::{self, pipe::MemoryOutputPipe, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::preview2::{self, pipe::MemoryOutputPipe, WasiCtx, WasiCtxBuilder, WasiView, WasiTcpView};
 use wasmtime_wasi_http::{
     bindings::http::types::ErrorCode,
     body::HyperIncomingBody,
@@ -50,6 +50,10 @@ impl WasiView for Ctx {
     fn ctx_mut(&mut self) -> &mut WasiCtx {
         &mut self.wasi
     }
+}
+
+impl WasiTcpView for Ctx {
+    // TODO
 }
 
 impl WasiHttpView for Ctx {

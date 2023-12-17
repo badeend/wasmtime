@@ -276,6 +276,15 @@ pub trait WasiView: Send {
     fn ctx_mut(&mut self) -> &mut WasiCtx;
 }
 
+pub trait WasiTcpView: WasiView {
+    fn check_allowed_tcp(&mut self) -> std::io::Result<()> {
+        Err(rustix::io::Errno::ACCESS.into())
+    }
+    fn check_tcp_addr(&mut self, addr: &SocketAddr, reason: SocketAddrUse) -> std::io::Result<()> {
+        Err(rustix::io::Errno::ACCESS.into())
+    }
+}
+
 pub struct WasiCtx {
     pub(crate) random: Box<dyn RngCore + Send + Sync>,
     pub(crate) insecure_random: Box<dyn RngCore + Send + Sync>,
@@ -288,8 +297,8 @@ pub struct WasiCtx {
     pub(crate) stdin: Box<dyn StdinStream>,
     pub(crate) stdout: Box<dyn StdoutStream>,
     pub(crate) stderr: Box<dyn StdoutStream>,
-    pub(crate) socket_addr_check: SocketAddrCheck,
-    pub(crate) allowed_network_uses: AllowedNetworkUses,
+    pub socket_addr_check: SocketAddrCheck,
+    pub allowed_network_uses: AllowedNetworkUses,
 }
 
 pub struct AllowedNetworkUses {
@@ -320,7 +329,7 @@ impl AllowedNetworkUses {
         Ok(())
     }
 
-    pub(crate) fn check_allowed_tcp(&self) -> std::io::Result<()> {
+    pub fn check_allowed_tcp(&self) -> std::io::Result<()> {
         if !self.tcp {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,

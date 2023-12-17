@@ -9,7 +9,7 @@ use crate::preview2::{
     },
     network::SocketAddressFamily,
 };
-use crate::preview2::{Pollable, SocketResult, WasiView};
+use crate::preview2::{Pollable, SocketResult, WasiTcpView};
 use cap_net_ext::Blocking;
 use cap_std::net::TcpListener;
 use io_lifetimes::AsSocketlike;
@@ -20,19 +20,19 @@ use std::time::Duration;
 use tokio::io::Interest;
 use wasmtime::component::Resource;
 
-impl<T: WasiView> tcp::Host for T {}
+impl<T: WasiTcpView> tcp::Host for T {}
 
-impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
+impl<T: WasiTcpView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
     fn start_bind(
         &mut self,
         this: Resource<tcp::TcpSocket>,
         network: Resource<Network>,
         local_address: IpSocketAddress,
     ) -> SocketResult<()> {
-        self.ctx().allowed_network_uses.check_allowed_tcp()?;
-        let table = self.table_mut();
+        self.check_allowed_tcp()?;
+        let table = self.table();
         let socket = table.get(&this)?;
-        let network = table.get(&network)?;
+        let _network = table.get(&network)?;
         let local_address: SocketAddr = local_address.into();
 
         match socket.tcp_state {
@@ -46,7 +46,9 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
 
         {
             // Ensure that we're allowed to connect to this address.
-            network.check_socket_addr(&local_address, SocketAddrUse::TcpBind)?;
+            self.check_tcp_addr(&local_address, SocketAddrUse::TcpBind)?;
+
+            let socket = self.table().get(&this)?;
             let listener = &*socket.tcp_socket().as_socketlike_view::<TcpListener>();
 
             // Automatically bypass the TIME_WAIT state when the user is trying
@@ -74,7 +76,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
             })?;
         }
 
-        let socket = table.get_mut(&this)?;
+        let socket = self.table_mut().get_mut(&this)?;
         socket.tcp_state = TcpState::BindStarted;
 
         Ok(())
@@ -100,9 +102,10 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         network: Resource<Network>,
         remote_address: IpSocketAddress,
     ) -> SocketResult<()> {
-        self.ctx().allowed_network_uses.check_allowed_tcp()?;
-        let table = self.table_mut();
+        self.check_allowed_tcp()?;
+        
         let r = {
+            let table = self.table();
             let socket = table.get(&this)?;
             let network = table.get(&network)?;
             let remote_address: SocketAddr = remote_address.into();
@@ -124,12 +127,16 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
             util::validate_address_family(&remote_address, &socket.family)?;
 
             // Ensure that we're allowed to connect to this address.
-            network.check_socket_addr(&remote_address, SocketAddrUse::TcpConnect)?;
+            self.check_tcp_addr(&remote_address, SocketAddrUse::TcpConnect)?;
+
+            let socket = self.table().get(&this)?;
             let listener = &*socket.tcp_socket().as_socketlike_view::<TcpListener>();
 
             // Do an OS `connect`. Our socket is non-blocking, so it'll either...
             util::tcp_connect(listener, &remote_address)
         };
+
+        let table = self.table_mut();
 
         match r {
             // succeed immediately,
@@ -200,7 +207,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
     }
 
     fn start_listen(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<()> {
-        self.ctx().allowed_network_uses.check_allowed_tcp()?;
+        self.check_allowed_tcp()?;
         let table = self.table_mut();
         let socket = table.get_mut(&this)?;
 
@@ -248,7 +255,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         Resource<InputStream>,
         Resource<OutputStream>,
     )> {
-        self.ctx().allowed_network_uses.check_allowed_tcp()?;
+        self.check_allowed_tcp()?;
         let table = self.table();
         let socket = table.get(&this)?;
 

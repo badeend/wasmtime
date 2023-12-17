@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::thread;
 use wasmtime::{Engine, Func, Module, Store, StoreLimits, Val, ValType};
 use wasmtime_wasi::maybe_exit_on_error;
-use wasmtime_wasi::preview2;
+use wasmtime_wasi::preview2::{self, SocketAddrUse};
 use wasmtime_wasi::sync::{ambient_authority, Dir, TcpListener, WasiCtxBuilder};
 
 #[cfg(feature = "wasi-nn")]
@@ -832,6 +832,22 @@ impl preview2::WasiView for Host {
         Arc::get_mut(ctx).expect("preview2 is not compatible with threads")
     }
 }
+
+impl preview2::WasiTcpView for Host {
+
+    fn check_tcp_addr(
+        &mut self,
+        addr: &std::net::SocketAddr,
+        reason: SocketAddrUse,
+    ) -> std::io::Result<()> {
+        self.preview2_ctx.as_ref().unwrap().socket_addr_check.check(addr, reason)
+    }
+
+    fn check_allowed_tcp(&mut self) -> std::io::Result<()> {
+        self.preview2_ctx.as_ref().unwrap().allowed_network_uses.check_allowed_tcp()
+    }
+}
+
 
 impl preview2::preview1::WasiPreview1View for Host {
     fn adapter(&self) -> &preview2::preview1::WasiPreview1Adapter {
