@@ -11,8 +11,9 @@ use anyhow::{anyhow, bail, Context as _, Error, Result};
 use clap::Parser;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use wasmtime::component::Component;
 use wasmtime::{Engine, Func, Module, Store, StoreLimits, Val, ValType};
 use wasmtime_wasi::maybe_exit_on_error;
 use wasmtime_wasi::preview2;
@@ -101,12 +102,6 @@ pub struct RunCommand {
     pub module_and_args: Vec<OsString>,
 }
 
-enum CliLinker {
-    Core(wasmtime::Linker<Host>),
-    #[cfg(feature = "component-model")]
-    Component(wasmtime::component::Linker<Host>),
-}
-
 impl RunCommand {
     /// Executes the command.
     pub fn execute(mut self) -> Result<()> {
@@ -142,28 +137,22 @@ impl RunCommand {
             }
         }
 
-        let mut linker = match &main {
-            RunTarget::Core(_) => CliLinker::Core(wasmtime::Linker::new(&engine)),
+        match main {
+            RunTarget::Core(module) => self.execute_core(engine, module),
             #[cfg(feature = "component-model")]
-            RunTarget::Component(_) => {
-                CliLinker::Component(wasmtime::component::Linker::new(&engine))
-            }
-        };
+            RunTarget::Component(component) => self.execute_component(engine, component),
+        }
+    }
+
+    fn execute_core(self, engine: Engine, main: Module) -> Result<()> {
+        let mut linker = wasmtime::Linker::new(&engine);
         if let Some(enable) = self.run.common.wasm.unknown_exports_allow {
-            match &mut linker {
-                CliLinker::Core(l) => {
-                    l.allow_unknown_exports(enable);
-                }
-                #[cfg(feature = "component-model")]
-                CliLinker::Component(_) => {
-                    bail!("--allow-unknown-exports not supported with components");
-                }
-            }
+            linker.allow_unknown_exports(enable);
         }
 
-        let host = Host::default();
+        let host = CoreHost::default();
         let mut store = Store::new(&engine, host);
-        self.populate_with_wasi(&mut linker, &mut store, &main)?;
+        self.populate_with_wasi_core(&mut linker, &mut store, &main)?;
 
         store.data_mut().limits = self.run.store_limits();
         store.limiter(|t| &mut t.limits);
@@ -176,9 +165,7 @@ impl RunCommand {
 
         // Load the preload wasm modules.
         let mut modules = Vec::new();
-        if let RunTarget::Core(m) = &main {
-            modules.push((String::new(), m.clone()));
-        }
+        modules.push((String::new(), main.clone()));
         for (name, path) in self.preloads.iter() {
             // Read the wasm module binary either as `*.wat` or a raw binary
             let module = match self.run.load_module(&engine, path)? {
@@ -189,29 +176,68 @@ impl RunCommand {
             modules.push((name.clone(), module.clone()));
 
             // Add the module's functions to the linker.
-            match &mut linker {
-                #[cfg(feature = "cranelift")]
-                CliLinker::Core(linker) => {
-                    linker.module(&mut store, name, &module).context(format!(
-                        "failed to process preload `{}` at `{}`",
-                        name,
-                        path.display()
-                    ))?;
-                }
-                #[cfg(not(feature = "cranelift"))]
-                CliLinker::Core(_) => {
-                    bail!("support for --preload disabled at compile time");
-                }
-                #[cfg(feature = "component-model")]
-                CliLinker::Component(_) => {
-                    bail!("--preload cannot be used with components");
-                }
+            #[cfg(feature = "cranelift")]
+            {
+                linker.module(&mut store, name, &module).context(format!(
+                    "failed to process preload `{}` at `{}`",
+                    name,
+                    path.display()
+                ))?;
+            }
+            #[cfg(not(feature = "cranelift"))]
+            {
+                bail!("support for --preload disabled at compile time");
             }
         }
 
         // Load the main wasm module.
         match self
-            .load_main_module(&mut store, &mut linker, &main, modules)
+            .load_main_module_core(&mut store, &mut linker, &main, modules)
+            .with_context(|| {
+                format!(
+                    "failed to run main module `{}`",
+                    self.module_and_args[0].to_string_lossy()
+                )
+            }) {
+            Ok(()) => (),
+            Err(e) => {
+                // Exit the process if Wasmtime understands the error;
+                // otherwise, fall back on Rust's default error printing/return
+                // code.
+                return Err(maybe_exit_on_error(e));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "component-model")]
+    fn execute_component(self, engine: Engine, main: Component) -> Result<()> {
+        let mut linker = wasmtime::component::Linker::new(&engine);
+        if let Some(_) = self.run.common.wasm.unknown_exports_allow {
+            bail!("--allow-unknown-exports not supported with components");
+        }
+
+        let host = ComponentHost::default();
+        let mut store = Store::new(&engine, host);
+        self.populate_with_wasi_component(&mut linker, &mut store)?;
+
+        store.data_mut().limits = self.run.store_limits();
+        store.limiter(|t| &mut t.limits);
+
+        // If fuel has been configured, we want to add the configured
+        // fuel amount to this store.
+        if let Some(fuel) = self.run.common.wasm.fuel {
+            store.set_fuel(fuel)?;
+        }
+
+        if !self.preloads.is_empty() {
+            bail!("--preload cannot be used with components");
+        }
+
+        // Load the main wasm module.
+        match self
+            .load_main_module_component(&mut store, &mut linker, &main)
             .with_context(|| {
                 format!(
                     "failed to run main module `{}`",
@@ -279,14 +305,41 @@ impl RunCommand {
         Ok(result)
     }
 
-    fn setup_epoch_handler(
+    fn setup_epoch_handler_core(
         &self,
-        store: &mut Store<Host>,
+        store: &mut Store<CoreHost>,
         modules: Vec<(String, Module)>,
-    ) -> Result<Box<dyn FnOnce(&mut Store<Host>)>> {
+    ) -> Result<Box<dyn FnOnce(&mut Store<CoreHost>)>> {
         if let Some(Profile::Guest { path, interval }) = &self.run.profile {
             #[cfg(feature = "profiling")]
-            return Ok(self.setup_guest_profiler(store, modules, path, *interval));
+            return Ok(self.setup_guest_profiler_core(store, modules, path, *interval));
+            #[cfg(not(feature = "profiling"))]
+            {
+                let _ = (modules, path, interval);
+                bail!("support for profiling disabled at compile time");
+            }
+        }
+
+        if let Some(timeout) = self.run.common.wasm.timeout {
+            store.set_epoch_deadline(1);
+            let engine = store.engine().clone();
+            thread::spawn(move || {
+                thread::sleep(timeout);
+                engine.increment_epoch();
+            });
+        }
+
+        Ok(Box::new(|_store| {}))
+    }
+
+    fn setup_epoch_handler_component(
+        &self,
+        store: &mut Store<ComponentHost>,
+        modules: Vec<(String, Module)>,
+    ) -> Result<Box<dyn FnOnce(&mut Store<ComponentHost>)>> {
+        if let Some(Profile::Guest { path, interval }) = &self.run.profile {
+            #[cfg(feature = "profiling")]
+            return Ok(self.setup_guest_profiler_component(store, modules, path, *interval));
             #[cfg(not(feature = "profiling"))]
             {
                 let _ = (modules, path, interval);
@@ -307,20 +360,20 @@ impl RunCommand {
     }
 
     #[cfg(feature = "profiling")]
-    fn setup_guest_profiler(
+    fn setup_guest_profiler_core(
         &self,
-        store: &mut Store<Host>,
+        store: &mut Store<CoreHost>,
         modules: Vec<(String, Module)>,
         path: &str,
         interval: std::time::Duration,
-    ) -> Box<dyn FnOnce(&mut Store<Host>)> {
+    ) -> Box<dyn FnOnce(&mut Store<CoreHost>)> {
         use wasmtime::{AsContextMut, GuestProfiler, UpdateDeadline};
 
         let module_name = self.module_and_args[0].to_str().unwrap_or("<main module>");
         store.data_mut().guest_profiler =
             Some(Arc::new(GuestProfiler::new(module_name, interval, modules)));
 
-        fn sample(mut store: impl AsContextMut<Data = Host>) {
+        fn sample(mut store: impl AsContextMut<Data = CoreHost>) {
             let mut profiler = store
                 .as_context_mut()
                 .data_mut()
@@ -375,23 +428,83 @@ impl RunCommand {
         });
     }
 
-    fn load_main_module(
+    #[cfg(feature = "profiling")]
+    fn setup_guest_profiler_component(
         &self,
-        store: &mut Store<Host>,
-        linker: &mut CliLinker,
-        module: &RunTarget,
+        store: &mut Store<ComponentHost>,
+        modules: Vec<(String, Module)>,
+        path: &str,
+        interval: std::time::Duration,
+    ) -> Box<dyn FnOnce(&mut Store<ComponentHost>)> {
+        use wasmtime::{AsContextMut, GuestProfiler, UpdateDeadline};
+
+        let module_name = self.module_and_args[0].to_str().unwrap_or("<main module>");
+        store.data_mut().guest_profiler = Some(GuestProfiler::new(module_name, interval, modules));
+
+        fn sample(mut store: impl AsContextMut<Data = ComponentHost>) {
+            let mut profiler = store
+                .as_context_mut()
+                .data_mut()
+                .guest_profiler
+                .take()
+                .unwrap();
+            profiler.sample(&store);
+            store.as_context_mut().data_mut().guest_profiler = Some(profiler);
+        }
+
+        if let Some(timeout) = self.run.common.wasm.timeout {
+            let mut timeout = (timeout.as_secs_f64() / interval.as_secs_f64()).ceil() as u64;
+            assert!(timeout > 0);
+            store.epoch_deadline_callback(move |mut store| {
+                sample(&mut store);
+                timeout -= 1;
+                if timeout == 0 {
+                    bail!("timeout exceeded");
+                }
+                Ok(UpdateDeadline::Continue(1))
+            });
+        } else {
+            store.epoch_deadline_callback(move |mut store| {
+                sample(&mut store);
+                Ok(UpdateDeadline::Continue(1))
+            });
+        }
+
+        store.set_epoch_deadline(1);
+        let engine = store.engine().clone();
+        thread::spawn(move || loop {
+            thread::sleep(interval);
+            engine.increment_epoch();
+        });
+
+        let path = path.to_string();
+        return Box::new(move |store| {
+            let profiler = store.data_mut().guest_profiler.take().unwrap();
+            if let Err(e) = std::fs::File::create(&path)
+                .map_err(anyhow::Error::new)
+                .and_then(|output| profiler.finish(std::io::BufWriter::new(output)))
+            {
+                eprintln!("failed writing profile at {path}: {e:#}");
+            } else {
+                eprintln!();
+                eprintln!("Profile written to: {path}");
+                eprintln!("View this profile at https://profiler.firefox.com/.");
+            }
+        });
+    }
+
+    fn load_main_module_core(
+        &self,
+        store: &mut Store<CoreHost>,
+        linker: &mut wasmtime::Linker<CoreHost>,
+        main: &Module,
         modules: Vec<(String, Module)>,
     ) -> Result<()> {
         // The main module might be allowed to have unknown imports, which
         // should be defined as traps:
         if self.run.common.wasm.unknown_imports_trap == Some(true) {
             #[cfg(feature = "cranelift")]
-            match linker {
-                CliLinker::Core(linker) => {
-                    linker.define_unknown_imports_as_traps(module.unwrap_core())?;
-                }
-                _ => bail!("cannot use `--trap-unknown-imports` with components"),
-            }
+            linker.define_unknown_imports_as_traps(main)?;
             #[cfg(not(feature = "cranelift"))]
             bail!("support for `unknown-imports-trap` disabled at compile time");
         }
@@ -399,73 +512,42 @@ impl RunCommand {
         // ...or as default values.
         if self.run.common.wasm.unknown_imports_default == Some(true) {
             #[cfg(feature = "cranelift")]
-            match linker {
-                CliLinker::Core(linker) => {
-                    linker.define_unknown_imports_as_default_values(module.unwrap_core())?;
-                }
-                _ => bail!("cannot use `--default-values-unknown-imports` with components"),
-            }
+            linker.define_unknown_imports_as_default_values(main)?;
             #[cfg(not(feature = "cranelift"))]
             bail!("support for `unknown-imports-trap` disabled at compile time");
         }
 
-        let finish_epoch_handler = self.setup_epoch_handler(store, modules)?;
+        let finish_epoch_handler = self.setup_epoch_handler_core(store, modules)?;
 
-        let result = match linker {
-            CliLinker::Core(linker) => {
-                let module = module.unwrap_core();
-                let instance = linker.instantiate(&mut *store, &module).context(format!(
-                    "failed to instantiate {:?}",
-                    self.module_and_args[0]
-                ))?;
+        let result = {
+            let instance = linker.instantiate(&mut *store, main).context(format!(
+                "failed to instantiate {:?}",
+                self.module_and_args[0]
+            ))?;
 
-                // If `_initialize` is present, meaning a reactor, then invoke
-                // the function.
-                if let Some(func) = instance.get_func(&mut *store, "_initialize") {
-                    func.typed::<(), ()>(&store)?.call(&mut *store, ())?;
-                }
-
-                // Look for the specific function provided or otherwise look for
-                // "" or "_start" exports to run as a "main" function.
-                let func = if let Some(name) = &self.invoke {
-                    Some(
-                        instance
-                            .get_func(&mut *store, name)
-                            .ok_or_else(|| anyhow!("no func export named `{}` found", name))?,
-                    )
-                } else {
-                    instance
-                        .get_func(&mut *store, "")
-                        .or_else(|| instance.get_func(&mut *store, "_start"))
-                };
-
-                match func {
-                    Some(func) => self.invoke_func(store, func),
-                    None => Ok(()),
-                }
+            // If `_initialize` is present, meaning a reactor, then invoke
+            // the function.
+            if let Some(func) = instance.get_func(&mut *store, "_initialize") {
+                func.typed::<(), ()>(&store)?.call(&mut *store, ())?;
             }
-            #[cfg(feature = "component-model")]
-            CliLinker::Component(linker) => {
-                if self.invoke.is_some() {
-                    bail!("using `--invoke` with components is not supported");
-                }
 
-                let component = module.unwrap_component();
+            // Look for the specific function provided or otherwise look for
+            // "" or "_start" exports to run as a "main" function.
+            let func = if let Some(name) = &self.invoke {
+                Some(
+                    instance
+                        .get_func(&mut *store, name)
+                        .ok_or_else(|| anyhow!("no func export named `{}` found", name))?,
+                )
+            } else {
+                instance
+                    .get_func(&mut *store, "")
+                    .or_else(|| instance.get_func(&mut *store, "_start"))
+            };
 
-                let (command, _instance) =
-                    preview2::command::sync::Command::instantiate(&mut *store, component, linker)?;
-                let result = command
-                    .wasi_cli_run()
-                    .call_run(&mut *store)
-                    .context("failed to invoke `run` function")
-                    .map_err(|e| self.handle_core_dump(&mut *store, e));
-
-                // Translate the `Result<(),()>` produced by wasm into a feigned
-                // explicit exit here with status 1 if `Err(())` is returned.
-                result.and_then(|wasm_result| match wasm_result {
-                    Ok(()) => Ok(()),
-                    Err(()) => Err(wasmtime_wasi::I32Exit(1).into()),
-                })
+            match func {
+                Some(func) => self.invoke_func(store, func),
+                None => Ok(()),
             }
         };
         finish_epoch_handler(store);
@@ -473,7 +555,48 @@ impl RunCommand {
         result
     }
 
-    fn invoke_func(&self, store: &mut Store<Host>, func: Func) -> Result<()> {
+    fn load_main_module_component(
+        &self,
+        store: &mut Store<ComponentHost>,
+        linker: &mut wasmtime::component::Linker<ComponentHost>,
+        main: &Component,
+    ) -> Result<()> {
+        if self.run.common.wasm.unknown_imports_trap == Some(true) {
+            bail!("cannot use `--trap-unknown-imports` with components");
+        }
+
+        if self.run.common.wasm.unknown_imports_default == Some(true) {
+            bail!("cannot use `--default-values-unknown-imports` with components");
+        }
+
+        let finish_epoch_handler = self.setup_epoch_handler_component(store, vec![])?;
+
+        let result = {
+            if self.invoke.is_some() {
+                bail!("using `--invoke` with components is not supported");
+            }
+
+            let (command, _instance) =
+                preview2::command::sync::Command::instantiate(&mut *store, main, linker)?;
+            let result = command
+                .wasi_cli_run()
+                .call_run(&mut *store)
+                .context("failed to invoke `run` function")
+                .map_err(|e| self.handle_core_dump(&mut *store, e));
+
+            // Translate the `Result<(),()>` produced by wasm into a feigned
+            // explicit exit here with status 1 if `Err(())` is returned.
+            result.and_then(|wasm_result| match wasm_result {
+                Ok(()) => Ok(()),
+                Err(()) => Err(wasmtime_wasi::I32Exit(1).into()),
+            })
+        };
+        finish_epoch_handler(store);
+
+        result
+    }
+
+    fn invoke_func<T>(&self, store: &mut Store<T>, func: Func) -> Result<()> {
         let ty = func.ty(&store);
         if ty.params().len() > 0 {
             eprintln!(
@@ -549,7 +672,7 @@ impl RunCommand {
     }
 
     #[cfg(feature = "coredump")]
-    fn handle_core_dump(&self, store: &mut Store<Host>, err: Error) -> Error {
+    fn handle_core_dump<T>(&self, store: &mut Store<T>, err: Error) -> Error {
         let coredump_path = match &self.run.common.debug.coredump {
             Some(path) => path,
             None => return err,
@@ -575,44 +698,36 @@ impl RunCommand {
     }
 
     /// Populates the given `Linker` with WASI APIs.
-    fn populate_with_wasi(
+    fn populate_with_wasi_core(
         &self,
-        linker: &mut CliLinker,
-        store: &mut Store<Host>,
-        module: &RunTarget,
+        linker: &mut wasmtime::Linker<CoreHost>,
+        store: &mut Store<CoreHost>,
+        main: &Module,
     ) -> Result<()> {
         if self.run.common.wasi.common != Some(false) {
-            match linker {
-                CliLinker::Core(linker) => {
-                    match (self.run.common.wasi.preview2, self.run.common.wasi.threads) {
-                        // If preview2 is explicitly disabled, or if threads
-                        // are enabled, then use the historical preview1
-                        // implementation.
-                        (Some(false), _) | (None, Some(true)) => {
-                            wasmtime_wasi::add_to_linker(linker, |host| {
-                                host.preview1_ctx.as_mut().unwrap()
-                            })?;
-                            self.set_preview1_ctx(store)?;
-                        }
-                        // If preview2 was explicitly requested, always use it.
-                        // Otherwise use it so long as threads are disabled.
-                        //
-                        // Note that for now `preview0` is currently
-                        // default-enabled but this may turn into
-                        // default-disabled in the future.
-                        (Some(true), _) | (None, Some(false) | None) => {
-                            if self.run.common.wasi.preview0 != Some(false) {
-                                preview2::preview0::add_to_linker_sync(linker)?;
-                            }
-                            preview2::preview1::add_to_linker_sync(linker)?;
-                            self.set_preview2_ctx(store)?;
-                        }
-                    }
+            match (self.run.common.wasi.preview2, self.run.common.wasi.threads) {
+                // If preview2 is explicitly disabled, or if threads
+                // are enabled, then use the historical preview1
+                // implementation.
+                (Some(false), _) | (None, Some(true)) => {
+                    wasmtime_wasi::add_to_linker(linker, |host| {
+                        host.preview1_ctx.as_mut().unwrap()
+                    })?;
+                    self.set_preview1_ctx(store)?;
                 }
-                #[cfg(feature = "component-model")]
-                CliLinker::Component(linker) => {
-                    preview2::command::sync::add_to_linker(linker)?;
-                    self.set_preview2_ctx(store)?;
+                // If preview2 was explicitly requested, always use it.
+                // Otherwise use it so long as threads are disabled.
+                //
+                // Note that for now `preview0` is currently
+                // default-enabled but this may turn into
+                // default-disabled in the future.
+                (Some(true), _) | (None, Some(false) | None) => {
+                    if self.run.common.wasi.preview0 != Some(false) {
+                        preview2::preview0::add_to_linker_sync(linker)?;
+                    }
+                    preview2::preview1::add_to_linker_sync(linker)?;
+                    let ctx = self.build_preview2_ctx()?;
+                    store.data_mut().preview2_ctx = Some(Arc::new(Mutex::new(ctx)));
                 }
             }
         }
@@ -624,28 +739,18 @@ impl RunCommand {
             }
             #[cfg(feature = "wasi-nn")]
             {
-                match linker {
-                    CliLinker::Core(linker) => {
-                        wasmtime_wasi_nn::witx::add_to_linker(linker, |host| {
-                            // This WASI proposal is currently not protected against
-                            // concurrent access--i.e., when wasi-threads is actively
-                            // spawning new threads, we cannot (yet) safely allow access and
-                            // fail if more than one thread has `Arc`-references to the
-                            // context. Once this proposal is updated (as wasi-common has
-                            // been) to allow concurrent access, this `Arc::get_mut`
-                            // limitation can be removed.
-                            Arc::get_mut(host.wasi_nn.as_mut().unwrap())
-                                .expect("wasi-nn is not implemented with multi-threading support")
-                        })?;
-                    }
-                    #[cfg(feature = "component-model")]
-                    CliLinker::Component(linker) => {
-                        wasmtime_wasi_nn::wit::ML::add_to_linker(linker, |host| {
-                            Arc::get_mut(host.wasi_nn.as_mut().unwrap())
-                                .expect("wasi-nn is not implemented with multi-threading support")
-                        })?;
-                    }
-                }
+                wasmtime_wasi_nn::witx::add_to_linker(linker, |host| {
+                    // This WASI proposal is currently not protected against
+                    // concurrent access--i.e., when wasi-threads is actively
+                    // spawning new threads, we cannot (yet) safely allow access and
+                    // fail if more than one thread has `Arc`-references to the
+                    // context. Once this proposal is updated (as wasi-common has
+                    // been) to allow concurrent access, this `Arc::get_mut`
+                    // limitation can be removed.
+                    Arc::get_mut(host.wasi_nn.as_mut().unwrap())
+                        .expect("wasi-nn is not implemented with multi-threading support")
+                })?;
+
                 let graphs = self
                     .run
                     .common
@@ -662,9 +767,9 @@ impl RunCommand {
         if self.run.common.wasi.threads == Some(true) {
             #[cfg(not(feature = "wasi-threads"))]
             {
-                // Silence the unused warning for `module` as it is only used in the
+                // Silence the unused warning for `main` as it is only used in the
                 // conditionally-compiled wasi-threads.
-                let _ = &module;
+                let _ = &main;
 
                 bail!(
                     "Cannot enable wasi-threads when the binary is not compiled with this feature."
@@ -672,45 +777,78 @@ impl RunCommand {
             }
             #[cfg(feature = "wasi-threads")]
             {
-                let linker = match linker {
-                    CliLinker::Core(linker) => linker,
-                    _ => bail!("wasi-threads does not support components yet"),
-                };
-                let module = module.unwrap_core();
-                wasmtime_wasi_threads::add_to_linker(linker, store, &module, |host| {
+                wasmtime_wasi_threads::add_to_linker(linker, store, &main, |host| {
                     host.wasi_threads.as_ref().unwrap()
                 })?;
                 store.data_mut().wasi_threads = Some(Arc::new(WasiThreadsCtx::new(
-                    module.clone(),
+                    main.clone(),
                     Arc::new(linker.clone()),
                 )?));
             }
         }
 
         if self.run.common.wasi.http == Some(true) {
-            #[cfg(not(all(feature = "wasi-http", feature = "component-model")))]
+            bail!("Cannot enable wasi-http for core wasm modules");
+        }
+
+        Ok(())
+    }
+
+    /// Populates the given `Linker` with WASI APIs.
+    fn populate_with_wasi_component(
+        &self,
+        linker: &mut wasmtime::component::Linker<ComponentHost>,
+        store: &mut Store<ComponentHost>,
+    ) -> Result<()> {
+        if self.run.common.wasi.common != Some(false) {
+            preview2::command::sync::add_to_linker(linker)?;
+            store.data_mut().preview2_ctx = Some(self.build_preview2_ctx()?);
+        }
+
+        if self.run.common.wasi.nn == Some(true) {
+            #[cfg(not(feature = "wasi-nn"))]
+            {
+                bail!("Cannot enable wasi-nn when the binary is not compiled with this feature.");
+            }
+            #[cfg(feature = "wasi-nn")]
+            {
+                wasmtime_wasi_nn::wit::ML::add_to_linker(linker, |host| {
+                    host.wasi_nn.as_mut().unwrap()
+                })?;
+
+                let graphs = self
+                    .run
+                    .common
+                    .wasi
+                    .nn_graph
+                    .iter()
+                    .map(|g| (g.format.clone(), g.dir.clone()))
+                    .collect::<Vec<_>>();
+                let (backends, registry) = wasmtime_wasi_nn::preload(&graphs)?;
+                store.data_mut().wasi_nn = Some(WasiNnCtx::new(backends, registry));
+            }
+        }
+
+        if self.run.common.wasi.threads == Some(true) {
+            bail!("wasi-threads does not support components yet")
+        }
+
+        if self.run.common.wasi.http == Some(true) {
+            #[cfg(not(feature = "wasi-http"))]
             {
                 bail!("Cannot enable wasi-http when the binary is not compiled with this feature.");
             }
-            #[cfg(all(feature = "wasi-http", feature = "component-model"))]
+            #[cfg(feature = "wasi-http")]
             {
-                match linker {
-                    CliLinker::Core(_) => {
-                        bail!("Cannot enable wasi-http for core wasm modules");
-                    }
-                    CliLinker::Component(linker) => {
-                        wasmtime_wasi_http::proxy::sync::add_only_http_to_linker(linker)?;
-                    }
-                }
-
-                store.data_mut().wasi_http = Some(Arc::new(WasiHttpCtx {}));
+                wasmtime_wasi_http::proxy::sync::add_only_http_to_linker(linker)?;
+                store.data_mut().wasi_http = Some(WasiHttpCtx {});
             }
         }
 
         Ok(())
     }
 
-    fn set_preview1_ctx(&self, store: &mut Store<Host>) -> Result<()> {
+    fn set_preview1_ctx(&self, store: &mut Store<CoreHost>) -> Result<()> {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdio().args(&self.compute_argv()?)?;
 
@@ -742,7 +880,7 @@ impl RunCommand {
         Ok(())
     }
 
-    fn set_preview2_ctx(&self, store: &mut Store<Host>) -> Result<()> {
+    fn build_preview2_ctx(&self) -> Result<preview2::WasiCtx> {
         let mut builder = preview2::WasiCtxBuilder::new();
         builder.inherit_stdio().args(&self.compute_argv()?);
 
@@ -784,19 +922,19 @@ impl RunCommand {
             builder.allow_udp(enable);
         }
 
-        store.data_mut().preview2_ctx = Some(Arc::new(builder.build()));
-        Ok(())
+        Ok(builder.build())
     }
 }
 
 #[derive(Default, Clone)]
-struct Host {
+struct CoreHost {
     preview1_ctx: Option<wasmtime_wasi::WasiCtx>,
-    preview2_ctx: Option<Arc<preview2::WasiCtx>>,
+    preview2_ctx: Option<Arc<Mutex<preview2::WasiCtx>>>,
 
     // Resource table for preview2 if the `preview2_ctx` is in use, otherwise
     // "just" an empty table.
-    preview2_table: Arc<wasmtime::component::ResourceTable>,
+    preview2_table: Arc<Mutex<wasmtime::component::ResourceTable>>,
+
 
     // State necessary for the preview1 implementation of WASI backed by the
     // preview2 host implementation. Only used with the `--preview2` flag right
@@ -806,15 +944,13 @@ struct Host {
     #[cfg(feature = "wasi-nn")]
     wasi_nn: Option<Arc<WasiNnCtx>>,
     #[cfg(feature = "wasi-threads")]
-    wasi_threads: Option<Arc<WasiThreadsCtx<Host>>>,
-    #[cfg(feature = "wasi-http")]
-    wasi_http: Option<Arc<WasiHttpCtx>>,
+    wasi_threads: Option<Arc<WasiThreadsCtx<CoreHost>>>,
     limits: StoreLimits,
     #[cfg(feature = "profiling")]
     guest_profiler: Option<Arc<wasmtime::GuestProfiler>>,
 }
 
-impl preview2::WasiView for Host {
+impl preview2::WasiView for CoreHost {
     fn table(&self) -> &wasmtime::component::ResourceTable {
         &self.preview2_table
     }
@@ -833,25 +969,56 @@ impl preview2::WasiView for Host {
     }
 }
 
-impl preview2::preview1::WasiPreview1View for Host {
+impl preview2::preview1::WasiPreview1View for CoreHost {
     fn adapter(&self) -> &preview2::preview1::WasiPreview1Adapter {
         &self.preview2_adapter
     }
 
     fn adapter_mut(&mut self) -> &mut preview2::preview1::WasiPreview1Adapter {
-        Arc::get_mut(&mut self.preview2_adapter).expect("preview2 is not compatible with threads")
+        &mut self.preview2_adapter
+    }
+}
+
+#[derive(Default)]
+struct ComponentHost {
+    preview2_ctx: Option<preview2::WasiCtx>,
+    preview2_table: wasmtime::component::ResourceTable,
+
+    #[cfg(feature = "wasi-nn")]
+    wasi_nn: Option<WasiNnCtx>,
+    #[cfg(feature = "wasi-http")]
+    wasi_http: Option<WasiHttpCtx>,
+    limits: StoreLimits,
+    #[cfg(feature = "profiling")]
+    guest_profiler: Option<wasmtime::GuestProfiler>,
+}
+
+impl preview2::WasiView for ComponentHost {
+    fn table(&self) -> &wasmtime::component::ResourceTable {
+        &self.preview2_table
+    }
+
+    fn table_mut(&mut self) -> &mut wasmtime::component::ResourceTable {
+        &mut self.preview2_table
+    }
+
+    fn ctx(&self) -> &preview2::WasiCtx {
+        self.preview2_ctx.as_ref().unwrap()
+    }
+
+    fn ctx_mut(&mut self) -> &mut preview2::WasiCtx {
+        self.preview2_ctx.as_mut().unwrap()
     }
 }
 
 #[cfg(feature = "wasi-http")]
-impl wasmtime_wasi_http::types::WasiHttpView for Host {
+impl wasmtime_wasi_http::types::WasiHttpView for ComponentHost {
     fn ctx(&mut self) -> &mut WasiHttpCtx {
-        let ctx = self.wasi_http.as_mut().unwrap();
-        Arc::get_mut(ctx).expect("preview2 is not compatible with threads")
+        self.wasi_http.as_mut().expect("wasi-http not enabled")
     }
 
     fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
-        Arc::get_mut(&mut self.preview2_table).expect("preview2 is not compatible with threads")
+        &mut self.preview2_table
     }
 }
 
@@ -885,8 +1052,8 @@ fn ctx_set_listenfd(mut num_fd: usize, builder: &mut WasiCtxBuilder) -> Result<u
 }
 
 #[cfg(feature = "coredump")]
-fn write_core_dump(
-    store: &mut Store<Host>,
+fn write_core_dump<T>(
+    store: &mut Store<T>,
     err: &anyhow::Error,
     name: &str,
     path: &str,
