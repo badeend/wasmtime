@@ -193,10 +193,21 @@ impl<T: WasiView> streams::HostInputStream for T {
         stream: Resource<InputStream>,
         len: u64,
     ) -> StreamResult<Vec<u8>> {
-        if let InputStream::Host(s) = self.table().get_mut(&stream)? {
-            s.ready().await;
+        // if let InputStream::Host(s) = self.table().get_mut(&stream)? {
+        //     s.ready().await;
+        // }
+        // self.read(stream, len).await
+
+        loop {
+            let stream: Resource<InputStream> = Resource::new_borrow(stream.rep());
+            if let InputStream::Host(s) = self.table().get_mut(&stream)? {
+                s.ready().await;
+            };
+            match self.read(stream, len).await {
+                Ok(v) if v.len() == 0 => { /* WOULDBLOCK */ }
+                r => return r,
+            }
         }
-        self.read(stream, len).await
     }
 
     async fn skip(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<u64> {

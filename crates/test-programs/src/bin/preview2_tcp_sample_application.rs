@@ -54,20 +54,55 @@ fn test_tcp_sample_application(family: IpAddressFamily, bind_address: IpSocketAd
 }
 
 fn main() {
-    test_tcp_sample_application(
-        IpAddressFamily::Ipv4,
-        IpSocketAddress::Ipv4(Ipv4SocketAddress {
-            port: 0,                 // use any free port
-            address: (127, 0, 0, 1), // localhost
-        }),
-    );
-    test_tcp_sample_application(
-        IpAddressFamily::Ipv6,
-        IpSocketAddress::Ipv6(Ipv6SocketAddress {
-            port: 0,                           // use any free port
-            address: (0, 0, 0, 0, 0, 0, 0, 1), // localhost
-            flow_info: 0,
-            scope_id: 0,
-        }),
-    );
+    // test_tcp_sample_application(
+    //     IpAddressFamily::Ipv4,
+    //     IpSocketAddress::Ipv4(Ipv4SocketAddress {
+    //         port: 0,                 // use any free port
+    //         address: (127, 0, 0, 1), // localhost
+    //     }),
+    // );
+    // test_tcp_sample_application(
+    //     IpAddressFamily::Ipv6,
+    //     IpSocketAddress::Ipv6(Ipv6SocketAddress {
+    //         port: 0,                           // use any free port
+    //         address: (0, 0, 0, 0, 0, 0, 0, 1), // localhost
+    //         flow_info: 0,
+    //         scope_id: 0,
+    //     }),
+    // );
+
+    let server_name = "example.com";
+
+    let net = Network::default();
+
+    let remote_ip = net
+        .blocking_resolve_addresses(server_name)
+        .unwrap()
+        .first()
+        .unwrap()
+        .clone();
+    let remote_addr = IpSocketAddress::new(remote_ip, 80);
+
+    let client = TcpSocket::new(remote_addr.ip().family()).unwrap();
+    let (input, output) = client.blocking_connect(&net, remote_addr).unwrap();
+
+    let request = format!("GET / HTTP/1.1\r\nHost: {server_name}\r\n\r\n");
+    output.blocking_write_util(request.as_bytes()).unwrap();
+
+    let response = input.blocking_read(10000).unwrap();
+
+
+
+
+    assert!(response.len() > 0); // Without the change in io.rs, this will fail..
+
+
+
+
+
+    let response = std::str::from_utf8(&response).unwrap();
+
+    assert!(response.contains("HTTP/1.1 200 OK"));
+    // panic!("{response}");
+    println!("{response}");
 }

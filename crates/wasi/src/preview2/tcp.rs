@@ -112,7 +112,10 @@ impl HostInputStream for TcpReadStream {
 
             // Failing with `EWOULDBLOCK` is how we differentiate between a closed channel and no
             // data to read right now.
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                println!("WouldBlock");
+                0
+            },
 
             Err(e) => {
                 self.closed = true;
@@ -131,7 +134,9 @@ impl Subscribe for TcpReadStream {
         if self.closed {
             return;
         }
+        println!("ready?");
         self.stream.readable().await.unwrap();
+        println!("ready!");
     }
 }
 
