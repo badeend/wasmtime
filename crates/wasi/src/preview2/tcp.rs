@@ -325,16 +325,18 @@ impl TcpSocket {
 #[async_trait::async_trait]
 impl Subscribe for TcpSocket {
     async fn ready(&mut self) {
-        // Some states are ready immediately.
-        match self.tcp_state {
-            TcpState::BindStarted | TcpState::ListenStarted | TcpState::ConnectReady => return,
-            _ => {}
+        match &mut self.tcp_state {
+            TcpState::Default
+            | TcpState::BindStarted
+            | TcpState::Bound
+            | TcpState::ListenStarted
+            | TcpState::ConnectReady
+            | TcpState::ConnectFailed
+            | TcpState::Connected => {
+                // No async operation in progress.
+            }
+            TcpState::Connecting => self.inner.writable().await.unwrap(),
+            TcpState::Listening => self.inner.readable().await.unwrap(),
         }
-
-        // FIXME: Add `Interest::ERROR` when we update to tokio 1.32.
-        self.inner
-            .ready(Interest::READABLE | Interest::WRITABLE)
-            .await
-            .unwrap();
     }
 }

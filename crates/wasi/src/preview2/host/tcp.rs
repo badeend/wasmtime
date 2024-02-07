@@ -134,7 +134,14 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
                 return Ok(());
             }
             // continue in progress,
-            Err(err) if err == Errno::INPROGRESS => {}
+            Err(err) if err == Errno::INPROGRESS => {
+                let socket = table.get(&this)?;
+
+                // Let tokio know the socket is not ready yet:
+                let _: Result<(), _> = socket.tcp_socket().try_io(Interest::WRITABLE, || {
+                    Err(std::io::ErrorKind::WouldBlock.into())
+                });
+            }
             // or fail immediately.
             Err(err) => {
                 return Err(match err {
