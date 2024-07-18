@@ -784,9 +784,10 @@ struct TcpWriteStream {
 }
 
 enum LastWrite {
-    Waiting(AbortOnDropJoinHandle<Result<()>>),
+    Waiting(AbortOnDropJoinHandle<io::Result<()>>),
     Error(Error),
     Done,
+    Closed,
 }
 
 impl TcpWriteStream {
@@ -816,7 +817,7 @@ impl TcpWriteStream {
                         let _ = bytes.split_to(n);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(e),
                 }
             }
 
@@ -829,7 +830,7 @@ impl HostOutputStream for TcpWriteStream {
     fn write(&mut self, mut bytes: bytes::Bytes) -> Result<(), StreamError> {
         match self.last_write {
             LastWrite::Done => {}
-            LastWrite::Waiting(_) | LastWrite::Error(_) => {
+            LastWrite::Waiting(_) | LastWrite::Error(_) | LastWrite::Closed => {
                 return Err(StreamError::Trap(anyhow::anyhow!(
                     "unpermitted: must call check_write first"
                 )));
@@ -849,6 +850,11 @@ impl HostOutputStream for TcpWriteStream {
                     return Ok(());
                 }
 
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    self.last_write = LastWrite::Closed;
+                    return Err(StreamError::Closed);
+                }
+
                 Err(e) => return Err(StreamError::LastOperationFailed(e.into())),
             }
         }
@@ -864,12 +870,15 @@ impl HostOutputStream for TcpWriteStream {
     }
 
     fn check_write(&mut self) -> Result<usize, StreamError> {
-        match mem::replace(&mut self.last_write, LastWrite::Done) {
+        match mem::replace(&mut self.last_write, LastWrite::Closed) {
             LastWrite::Waiting(task) => {
                 self.last_write = LastWrite::Waiting(task);
                 return Ok(0);
             }
-            LastWrite::Done => {}
+            LastWrite::Done => {
+                self.last_write = LastWrite::Done;
+            }
+            LastWrite::Closed => return Err(StreamError::Closed),
             LastWrite::Error(e) => return Err(StreamError::LastOperationFailed(e.into())),
         }
 
@@ -888,7 +897,8 @@ impl Subscribe for TcpWriteStream {
         if let LastWrite::Waiting(task) = &mut self.last_write {
             self.last_write = match task.await {
                 Ok(()) => LastWrite::Done,
-                Err(e) => LastWrite::Error(e),
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => LastWrite::Closed,
+                Err(e) => LastWrite::Error(e.into()),
             };
         }
         if let LastWrite::Done = self.last_write {
