@@ -17,6 +17,7 @@ use std::io;
 use std::mem;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -54,7 +55,7 @@ enum TcpState {
     ConnectReady(io::Result<tokio::net::TcpStream>),
 
     /// An outgoing connection has been established.
-    Connected(Arc<tokio::net::TcpStream>),
+    Connected(Arc<TcpConnection>),
 
     Closed,
 }
@@ -75,6 +76,58 @@ impl std::fmt::Debug for TcpState {
             Self::Connected(_) => f.debug_tuple("Connected").finish(),
             Self::Closed => write!(f, "Closed"),
         }
+    }
+}
+
+struct TcpConnection {
+    stream: tokio::net::TcpStream,
+
+    /// Linux ignores `SHUT_RD` for TCP sockets in the sense that data
+    /// can continue to be read from the socket even after the partial shutdown.
+    /// This behavior does not match:
+    /// - The POSIX specification
+    /// - Their own documentation
+    /// - Other operating systems' behavior (Windows & MacOS)
+    ///
+    /// We patch up this inconsistency by keeping track of the shutdown status
+    /// and preventing further reads ourselves.
+    #[cfg(target_os = "linux")]
+    shut_down_for_reading: AtomicBool,
+}
+
+impl TcpConnection {
+    fn new(stream: tokio::net::TcpStream) -> Self {
+        Self {
+            stream,
+            #[cfg(target_os = "linux")]
+            shut_down_for_reading: AtomicBool::new(false),
+        }
+    }
+
+    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        self.stream
+            .as_socketlike_view::<std::net::TcpStream>()
+            .shutdown(how)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            if let std::net::Shutdown::Read | std::net::Shutdown::Both = how {
+                self.shut_down_for_reading.store(true, Ordering::SeqCst);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn try_read_buf<B: bytes::BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            if self.shut_down_for_reading.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+        }
+
+        self.stream.try_read_buf(buf)
     }
 }
 
@@ -145,7 +198,9 @@ impl TcpSocket {
             TcpState::Default(socket) | TcpState::Bound(socket) => {
                 Ok(socket.as_socketlike_view::<std::net::TcpStream>())
             }
-            TcpState::Connected(stream) => Ok(stream.as_socketlike_view::<std::net::TcpStream>()),
+            TcpState::Connected(connection) => Ok(connection
+                .stream
+                .as_socketlike_view::<std::net::TcpStream>()),
             TcpState::Listening { listener, .. } => {
                 Ok(listener.as_socketlike_view::<std::net::TcpStream>())
             }
@@ -276,11 +331,11 @@ impl TcpSocket {
 
         match result {
             Ok(stream) => {
-                let stream = Arc::new(stream);
-                self.tcp_state = TcpState::Connected(stream.clone());
+                let connection = Arc::new(TcpConnection::new(stream));
+                self.tcp_state = TcpState::Connected(connection.clone());
                 let input: InputStream =
-                    InputStream::Host(Box::new(TcpReadStream::new(stream.clone())));
-                let output: OutputStream = Box::new(TcpWriteStream::new(stream));
+                    InputStream::Host(Box::new(TcpReadStream::new(connection.clone())));
+                let output: OutputStream = Box::new(TcpWriteStream::new(connection));
                 Ok((input, output))
             }
             Err(err) => {
@@ -426,11 +481,12 @@ impl TcpSocket {
             }
         }
 
-        let client = Arc::new(client);
+        let connection = Arc::new(TcpConnection::new(client));
 
-        let input: InputStream = InputStream::Host(Box::new(TcpReadStream::new(client.clone())));
-        let output: OutputStream = Box::new(TcpWriteStream::new(client.clone()));
-        let tcp_socket = TcpSocket::from_state(TcpState::Connected(client), self.family)?;
+        let input: InputStream =
+            InputStream::Host(Box::new(TcpReadStream::new(connection.clone())));
+        let output: OutputStream = Box::new(TcpWriteStream::new(connection.clone()));
+        let tcp_socket = TcpSocket::from_state(TcpState::Connected(connection), self.family)?;
 
         Ok((tcp_socket, input, output))
     }
@@ -615,8 +671,8 @@ impl TcpSocket {
     }
 
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        let stream = match &self.tcp_state {
-            TcpState::Connected(stream) => stream,
+        let connection = match &self.tcp_state {
+            TcpState::Connected(connection) => connection,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -625,10 +681,7 @@ impl TcpSocket {
             }
         };
 
-        stream
-            .as_socketlike_view::<std::net::TcpStream>()
-            .shutdown(how)?;
-        Ok(())
+        connection.shutdown(how)
     }
 }
 
@@ -665,15 +718,15 @@ impl Subscribe for TcpSocket {
     }
 }
 
-pub(crate) struct TcpReadStream {
-    stream: Arc<tokio::net::TcpStream>,
+struct TcpReadStream {
+    connection: Arc<TcpConnection>,
     closed: bool,
 }
 
 impl TcpReadStream {
-    pub(crate) fn new(stream: Arc<tokio::net::TcpStream>) -> Self {
+    fn new(connection: Arc<TcpConnection>) -> Self {
         Self {
-            stream,
+            connection,
             closed: false,
         }
     }
@@ -690,7 +743,7 @@ impl HostInputStream for TcpReadStream {
         }
 
         let mut buf = bytes::BytesMut::with_capacity(size);
-        let n = match self.stream.try_read_buf(&mut buf) {
+        let n = match self.connection.try_read_buf(&mut buf) {
             // A 0-byte read indicates that the stream has closed.
             Ok(0) => {
                 self.closed = true;
@@ -719,14 +772,14 @@ impl Subscribe for TcpReadStream {
         if self.closed {
             return;
         }
-        self.stream.readable().await.unwrap();
+        self.connection.stream.readable().await.unwrap();
     }
 }
 
 const SOCKET_READY_SIZE: usize = 1024 * 1024 * 1024;
 
-pub(crate) struct TcpWriteStream {
-    stream: Arc<tokio::net::TcpStream>,
+struct TcpWriteStream {
+    connection: Arc<TcpConnection>,
     last_write: LastWrite,
 }
 
@@ -737,9 +790,9 @@ enum LastWrite {
 }
 
 impl TcpWriteStream {
-    pub(crate) fn new(stream: Arc<tokio::net::TcpStream>) -> Self {
+    fn new(connection: Arc<TcpConnection>) -> Self {
         Self {
-            stream,
+            connection,
             last_write: LastWrite::Done,
         }
     }
@@ -749,7 +802,7 @@ impl TcpWriteStream {
     fn background_write(&mut self, mut bytes: bytes::Bytes) {
         assert!(matches!(self.last_write, LastWrite::Done));
 
-        let stream = self.stream.clone();
+        let connection = self.connection.clone();
         self.last_write = LastWrite::Waiting(crate::runtime::spawn(async move {
             // Note: we are not using the AsyncWrite impl here, and instead using the TcpStream
             // primitive try_write, which goes directly to attempt a write with mio. This has
@@ -757,8 +810,8 @@ impl TcpWriteStream {
             // required to AsyncWrite, and 2. it eliminates any buffering in tokio we may need
             // to flush.
             while !bytes.is_empty() {
-                stream.writable().await?;
-                match stream.try_write(&bytes) {
+                connection.stream.writable().await?;
+                match connection.stream.try_write(&bytes) {
                     Ok(n) => {
                         let _ = bytes.split_to(n);
                     }
@@ -783,7 +836,7 @@ impl HostOutputStream for TcpWriteStream {
             }
         }
         while !bytes.is_empty() {
-            match self.stream.try_write(&bytes) {
+            match self.connection.stream.try_write(&bytes) {
                 Ok(n) => {
                     let _ = bytes.split_to(n);
                 }
@@ -820,7 +873,7 @@ impl HostOutputStream for TcpWriteStream {
             LastWrite::Error(e) => return Err(StreamError::LastOperationFailed(e.into())),
         }
 
-        let writable = self.stream.writable();
+        let writable = self.connection.stream.writable();
         futures::pin_mut!(writable);
         if crate::runtime::poll_noop(writable).is_none() {
             return Ok(0);
@@ -839,7 +892,7 @@ impl Subscribe for TcpWriteStream {
             };
         }
         if let LastWrite::Done = self.last_write {
-            self.stream.writable().await.unwrap();
+            self.connection.stream.writable().await.unwrap();
         }
     }
 }

@@ -25,11 +25,46 @@ fn test_tcp_input_stream_should_be_closed_by_remote_shutdown(
     });
 }
 
+/// InputStream::read should return `StreamError::Closed` after the connection has been locally shut down for receiving.
+fn test_tcp_input_stream_should_be_closed_by_local_shutdown(
+    net: &Network,
+    family: IpAddressFamily,
+) {
+    setup(net, family, |server, client| {
+        // On Linux, `recv` continues to work even after `shutdown(sock, SHUT_RD)`
+        // has been called. To properly test that this behavior doesn't happen in
+        // WASI, we make sure there's some data to read by the client:
+        server.output.blocking_write_util(b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.").unwrap();
+
+        // Wait for the write to reach the client:
+        client.input.subscribe().block();
+
+        // The stream should be readable:
+        assert_eq!(client.input.read(10).unwrap().len(), 10);
+
+        // Also test the 0 input length edge case:
+        assert_eq!(client.input.read(0).unwrap().len(), 0);
+
+        // Perform the shutdown
+        client.socket.shutdown(ShutdownType::Receive).unwrap();
+
+        // Stream should be closed:
+        // FYI, on Linux this fails if it wasn't for the precautions taken in the wasmtime-wasi implementation.
+        assert!(matches!(client.input.read(10), Err(StreamError::Closed)));
+
+        // Stream should still be closed, even when requesting 0 bytes:
+        assert!(matches!(client.input.read(0), Err(StreamError::Closed)));
+    });
+}
+
 fn main() {
     let net = Network::default();
 
     test_tcp_input_stream_should_be_closed_by_remote_shutdown(&net, IpAddressFamily::Ipv4);
     test_tcp_input_stream_should_be_closed_by_remote_shutdown(&net, IpAddressFamily::Ipv6);
+
+    test_tcp_input_stream_should_be_closed_by_local_shutdown(&net, IpAddressFamily::Ipv4);
+    test_tcp_input_stream_should_be_closed_by_local_shutdown(&net, IpAddressFamily::Ipv6);
 }
 
 struct Connection {
