@@ -82,25 +82,16 @@ impl std::fmt::Debug for TcpState {
 struct TcpConnection {
     stream: tokio::net::TcpStream,
 
-    /// Linux ignores `SHUT_RD` for TCP sockets in the sense that data
-    /// can continue to be read from the socket even after the partial shutdown.
-    /// This behavior does not match:
-    /// - The POSIX specification
-    /// - Their own documentation
-    /// - Other operating systems' behavior (Windows & MacOS)
-    ///
-    /// We patch up this inconsistency by keeping track of the shutdown status
-    /// and preventing further reads ourselves.
-    #[cfg(target_os = "linux")]
-    shut_down_for_reading: AtomicBool,
+    accept_new_reads: AtomicBool,
+    accept_new_writes: AtomicBool,
 }
 
 impl TcpConnection {
     fn new(stream: tokio::net::TcpStream) -> Self {
         Self {
             stream,
-            #[cfg(target_os = "linux")]
-            shut_down_for_reading: AtomicBool::new(false),
+            accept_new_reads: AtomicBool::new(true),
+            accept_new_writes: AtomicBool::new(true),
         }
     }
 
@@ -109,25 +100,15 @@ impl TcpConnection {
             .as_socketlike_view::<std::net::TcpStream>()
             .shutdown(how)?;
 
-        #[cfg(target_os = "linux")]
-        {
-            if let std::net::Shutdown::Read | std::net::Shutdown::Both = how {
-                self.shut_down_for_reading.store(true, Ordering::SeqCst);
-            }
+        if let std::net::Shutdown::Read | std::net::Shutdown::Both = how {
+            self.accept_new_reads.store(false, Ordering::SeqCst);
+        }
+
+        if let std::net::Shutdown::Write | std::net::Shutdown::Both = how {
+            self.accept_new_writes.store(false, Ordering::SeqCst);
         }
 
         Ok(())
-    }
-
-    fn try_read_buf<B: bytes::BufMut>(&self, buf: &mut B) -> io::Result<usize> {
-        #[cfg(target_os = "linux")]
-        {
-            if self.shut_down_for_reading.load(Ordering::SeqCst) {
-                return Ok(0);
-            }
-        }
-
-        self.stream.try_read_buf(buf)
     }
 }
 
@@ -738,12 +719,16 @@ impl HostInputStream for TcpReadStream {
         if self.closed {
             return Err(StreamError::Closed);
         }
+        if !self.connection.accept_new_reads.load(Ordering::SeqCst) {
+            self.closed = true;
+            return Err(StreamError::Closed);
+        }
         if size == 0 {
             return Ok(bytes::Bytes::new());
         }
 
         let mut buf = bytes::BytesMut::with_capacity(size);
-        let n = match self.connection.try_read_buf(&mut buf) {
+        let n = match self.connection.stream.try_read_buf(&mut buf) {
             // A 0-byte read indicates that the stream has closed.
             Ok(0) => {
                 self.closed = true;
@@ -798,6 +783,20 @@ impl TcpWriteStream {
         }
     }
 
+    fn try_write_portable(stream: &tokio::net::TcpStream, buf: &[u8]) -> io::Result<usize> {
+        stream.try_write(buf).map_err(|error| {
+            match Errno::from_io_error(&error) {
+                // Windows returns `WSAESHUTDOWN` when writing to a shut down socket.
+                // We normalize this to EPIPE, which is what the other platforms return.
+                // See: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-send#:~:text=WSAESHUTDOWN
+                #[cfg(windows)]
+                Some(Errno::SHUTDOWN) => io::Error::new(io::ErrorKind::BrokenPipe, error),
+
+                _ => error,
+            }
+        })
+    }
+
     /// Write `bytes` in a background task, remembering the task handle for use in a future call to
     /// `write_ready`
     fn background_write(&mut self, mut bytes: bytes::Bytes) {
@@ -812,7 +811,7 @@ impl TcpWriteStream {
             // to flush.
             while !bytes.is_empty() {
                 connection.stream.writable().await?;
-                match connection.stream.try_write(&bytes) {
+                match Self::try_write_portable(&connection.stream, &bytes) {
                     Ok(n) => {
                         let _ = bytes.split_to(n);
                     }
@@ -829,7 +828,12 @@ impl TcpWriteStream {
 impl HostOutputStream for TcpWriteStream {
     fn write(&mut self, mut bytes: bytes::Bytes) -> Result<(), StreamError> {
         match self.last_write {
-            LastWrite::Done => {}
+            LastWrite::Done => {
+                if !self.connection.accept_new_writes.load(Ordering::SeqCst) {
+                    self.last_write = LastWrite::Closed;
+                    return Err(StreamError::Closed);
+                }
+            }
             LastWrite::Waiting(_) | LastWrite::Error(_) | LastWrite::Closed => {
                 return Err(StreamError::Trap(anyhow::anyhow!(
                     "unpermitted: must call check_write first"
@@ -837,7 +841,7 @@ impl HostOutputStream for TcpWriteStream {
             }
         }
         while !bytes.is_empty() {
-            match self.connection.stream.try_write(&bytes) {
+            match Self::try_write_portable(&self.connection.stream, &bytes) {
                 Ok(n) => {
                     let _ = bytes.split_to(n);
                 }
@@ -866,7 +870,11 @@ impl HostOutputStream for TcpWriteStream {
         // `flush` is a no-op here, as we're not managing any internal buffer. Additionally,
         // `write_ready` will join the background write task if it's active, so following `flush`
         // with `write_ready` will have the desired effect.
-        Ok(())
+
+        match self.last_write {
+            LastWrite::Done | LastWrite::Waiting(_) | LastWrite::Error(_) => Ok(()),
+            LastWrite::Closed => Err(StreamError::Closed),
+        }
     }
 
     fn check_write(&mut self) -> Result<usize, StreamError> {
@@ -876,7 +884,12 @@ impl HostOutputStream for TcpWriteStream {
                 return Ok(0);
             }
             LastWrite::Done => {
-                self.last_write = LastWrite::Done;
+                if !self.connection.accept_new_writes.load(Ordering::SeqCst) {
+                    self.last_write = LastWrite::Closed;
+                    return Err(StreamError::Closed);
+                } else {
+                    self.last_write = LastWrite::Done;
+                }
             }
             LastWrite::Closed => return Err(StreamError::Closed),
             LastWrite::Error(e) => return Err(StreamError::LastOperationFailed(e.into())),

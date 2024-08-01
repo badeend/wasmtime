@@ -18,7 +18,7 @@ fn test_tcp_input_stream_should_be_closed_by_remote_shutdown(
         // The input stream should immediately signal StreamError::Closed.
         // Notably, it should _not_ return an empty list (the wasi-io equivalent of EWOULDBLOCK)
         // See: https://github.com/bytecodealliance/wasmtime/pull/8968
-        assert!(matches!(client.input.read(10), Err(StreamError::Closed))); // If this randomly fails, try tweaking the timeout above.
+        assert!(matches!(client.input.read(10), Err(StreamError::Closed)));
 
         // Stream should still be closed, even when requesting 0 bytes:
         assert!(matches!(client.input.read(0), Err(StreamError::Closed)));
@@ -49,7 +49,6 @@ fn test_tcp_input_stream_should_be_closed_by_local_shutdown(
         client.socket.shutdown(ShutdownType::Receive).unwrap();
 
         // Stream should be closed:
-        // FYI, on Linux this fails if it wasn't for the precautions taken in the wasmtime-wasi implementation.
         assert!(matches!(client.input.read(10), Err(StreamError::Closed)));
 
         // Stream should still be closed, even when requesting 0 bytes:
@@ -57,7 +56,7 @@ fn test_tcp_input_stream_should_be_closed_by_local_shutdown(
     });
 }
 
-/// OutputStream::write should return `StreamError::Closed` after the connection has been shut down for sending.
+/// OutputStream::write should return `StreamError::Closed` after the connection has been locally shut down for sending.
 fn test_tcp_output_stream_should_be_closed_by_local_shutdown(
     net: &Network,
     family: IpAddressFamily,
@@ -82,6 +81,7 @@ fn test_tcp_output_stream_should_be_closed_by_local_shutdown(
             client.output.check_write(),
             Err(StreamError::Closed)
         ));
+        assert!(matches!(client.output.flush(), Err(StreamError::Closed)));
     });
 }
 
