@@ -3,7 +3,7 @@ use crate::{
         host::{monotonic_clock, wall_clock},
         HostMonotonicClock, HostWallClock,
     },
-    filesystem::{Dir, OpenMode},
+    filesystem::{OpenMode, RealDir},
     network::{SocketAddrCheck, SocketAddrUse},
     pipe, random, stdio,
     stdio::{StdinStream, StdoutStream},
@@ -44,7 +44,7 @@ pub struct WasiCtxBuilder {
     stderr: Box<dyn StdoutStream>,
     env: Vec<(String, String)>,
     args: Vec<String>,
-    preopens: Vec<(Dir, String)>,
+    preopens: Vec<(RealDir, String)>,
     socket_addr_check: SocketAddrCheck,
     random: Box<dyn RngCore + Send>,
     insecure_random: Box<dyn RngCore + Send>,
@@ -340,7 +340,7 @@ impl WasiCtxBuilder {
             open_mode |= OpenMode::WRITE;
         }
         self.preopens.push((
-            Dir::new(
+            RealDir::new(
                 dir,
                 dir_perms,
                 file_perms,
@@ -647,7 +647,7 @@ pub struct WasiCtx {
     pub(crate) monotonic_clock: Box<dyn HostMonotonicClock + Send>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) args: Vec<String>,
-    pub(crate) preopens: Vec<(Dir, String)>,
+    pub(crate) preopens: Vec<(RealDir, String)>,
     pub(crate) stdin: Box<dyn StdinStream>,
     pub(crate) stdout: Box<dyn StdoutStream>,
     pub(crate) stderr: Box<dyn StdoutStream>,

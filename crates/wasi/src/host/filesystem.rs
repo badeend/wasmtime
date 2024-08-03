@@ -5,7 +5,7 @@ use crate::bindings::filesystem::types::{
 };
 use crate::bindings::io::streams::{InputStream, OutputStream};
 use crate::filesystem::{
-    Descriptor, Dir, File, FileInputStream, FileOutputStream, OpenMode, ReaddirIterator,
+    Descriptor, RealDir, File, FileInputStream, FileOutputStream, OpenMode, ReaddirIterator,
 };
 use crate::{DirPerms, FilePerms, FsError, FsResult, WasiImpl, WasiView};
 use anyhow::Context;
@@ -614,7 +614,7 @@ where
             .await?;
 
         match opened {
-            OpenResult::Dir(dir) => Ok(table.push(Descriptor::Dir(Dir::new(
+            OpenResult::Dir(dir) => Ok(table.push(Descriptor::Dir(RealDir::new(
                 dir,
                 d.perms,
                 d.file_perms,

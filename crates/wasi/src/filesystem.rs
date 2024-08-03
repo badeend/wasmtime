@@ -25,7 +25,7 @@ impl From<io::Error> for FsError {
 
 pub enum Descriptor {
     File(File),
-    Dir(Dir),
+    Dir(RealDir),
 }
 
 impl Descriptor {
@@ -36,7 +36,7 @@ impl Descriptor {
         }
     }
 
-    pub fn dir(&self) -> Result<&Dir, types::ErrorCode> {
+    pub fn dir(&self) -> Result<&RealDir, types::ErrorCode> {
         match self {
             Descriptor::Dir(d) => Ok(d),
             Descriptor::File(_) => Err(types::ErrorCode::NotDirectory),
@@ -174,7 +174,7 @@ bitflags::bitflags! {
 }
 
 #[derive(Clone)]
-pub struct Dir {
+pub struct RealDir {
     /// The operating system file descriptor this struct is mediating access
     /// to.
     ///
@@ -200,7 +200,7 @@ pub struct Dir {
     allow_blocking_current_thread: bool,
 }
 
-impl Dir {
+impl RealDir {
     pub fn new(
         dir: cap_std::fs::Dir,
         perms: DirPerms,
@@ -208,7 +208,7 @@ impl Dir {
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
     ) -> Self {
-        Dir {
+        RealDir {
             dir: Arc::new(dir),
             perms,
             file_perms,
