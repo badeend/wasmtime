@@ -5,9 +5,11 @@ use crate::runtime::{spawn_blocking, AbortOnDropJoinHandle};
 use crate::{HostOutputStream, StreamError, Subscribe, TrappableError};
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
+use std::collections::HashMap;
 use std::io;
 use std::mem;
 use std::sync::Arc;
+use system_interface::fs::FdFlags;
 
 pub type FsResult<T> = Result<T, FsError>;
 
@@ -25,41 +27,366 @@ impl From<io::Error> for FsError {
     }
 }
 
+#[derive(Clone)]
 pub enum Descriptor {
     File(File),
-    Dir(RealDir),
+    Dir(Dir),
+    VDir(VDir),
+}
+
+pub(crate) enum PreopenMatch<'a> {
+    Partial { dir: &'a Dir, path: String },
+    Exact(&'a Descriptor),
 }
 
 impl Descriptor {
     pub fn file(&self) -> Result<&File, types::ErrorCode> {
         match self {
             Descriptor::File(f) => Ok(f),
-            Descriptor::Dir(_) => Err(types::ErrorCode::BadDescriptor),
+            Descriptor::Dir(_) | Descriptor::VDir(_) => Err(types::ErrorCode::IsDirectory),
         }
     }
 
-    pub fn dir(&self) -> Result<&RealDir, types::ErrorCode> {
+    fn match_preopen<'a>(&'a self, path: String) -> Result<PreopenMatch<'a>, types::ErrorCode> {
+        fn lookup_virtual<'a>(
+            d: &'a VDir,
+            path: &str,
+        ) -> Result<PreopenMatch<'a>, types::ErrorCode> {
+            let (current, rest) = match path.split_once('/') {
+                Some((p, s)) => (p, Some(s)),
+                None => (path, None),
+            };
+
+            // TODO: properly implement these special segments:
+            if !VDir::is_valid_segment(current) {
+                return Err(types::ErrorCode::Unsupported);
+            }
+
+            let Some(child_descriptor) = d.entries.get(current) else {
+                return Err(types::ErrorCode::NoEntry);
+            };
+
+            let Some(rest) = rest else {
+                return Ok(PreopenMatch::Exact(child_descriptor));
+            };
+
+            match child_descriptor {
+                Descriptor::File(_) => Err(types::ErrorCode::NoEntry), // Can't navigate into a regular file.
+                Descriptor::Dir(d) => Ok(PreopenMatch::Partial {
+                    dir: d,
+                    path: rest.to_string(),
+                }),
+                Descriptor::VDir(v) => lookup_virtual(v, rest),
+            }
+        }
+
         match self {
-            Descriptor::Dir(d) => Ok(d),
             Descriptor::File(_) => Err(types::ErrorCode::NotDirectory),
+            Descriptor::Dir(d) => Ok(PreopenMatch::Partial { dir: d, path }),
+            Descriptor::VDir(v) => lookup_virtual(v, &path),
         }
     }
 
-    pub fn is_file(&self) -> bool {
-        match self {
-            Descriptor::File(_) => true,
-            Descriptor::Dir(_) => false,
-        }
-    }
-
-    pub fn is_dir(&self) -> bool {
-        match self {
-            Descriptor::File(_) => false,
-            Descriptor::Dir(_) => true,
+    fn match_preopened_dir<'a>(
+        &'a self,
+        path: String,
+    ) -> Result<(&'a Dir, String), types::ErrorCode> {
+        match self.match_preopen(path)? {
+            PreopenMatch::Partial { dir, path } => Ok((dir, path)),
+            PreopenMatch::Exact(_) => Err(ErrorCode::NotPermitted.into()),
         }
     }
 
     pub(crate) async fn advise(
+        &self,
+        offset: types::Filesize,
+        len: types::Filesize,
+        advice: types::Advice,
+    ) -> FsResult<()> {
+        self.file()?.advise(offset, len, advice).await
+    }
+
+    pub(crate) async fn sync_data(&self) -> FsResult<()> {
+        match self {
+            Descriptor::File(f) => f.sync_data().await,
+            Descriptor::Dir(d) => d.sync_data().await,
+            Descriptor::VDir(v) => v.sync_data(),
+        }
+    }
+
+    pub(crate) async fn get_flags(&self) -> FsResult<types::DescriptorFlags> {
+        match self {
+            Descriptor::File(f) => f.get_flags().await,
+            Descriptor::Dir(d) => d.get_flags().await,
+            Descriptor::VDir(v) => v.get_flags(),
+        }
+    }
+
+    pub(crate) async fn get_type(&self) -> FsResult<types::DescriptorType> {
+        match self {
+            Descriptor::File(f) => f.get_type().await,
+            Descriptor::Dir(_) | Descriptor::VDir(_) => Ok(types::DescriptorType::Directory),
+        }
+    }
+
+    pub(crate) async fn set_size(&self, size: types::Filesize) -> FsResult<()> {
+        self.file()?.set_size(size).await
+    }
+
+    pub(crate) async fn set_times(
+        &self,
+        atim: types::NewTimestamp,
+        mtim: types::NewTimestamp,
+    ) -> FsResult<()> {
+        match self {
+            Descriptor::File(f) => f.set_times(atim, mtim).await,
+            Descriptor::Dir(d) => d.set_times(atim, mtim).await,
+            Descriptor::VDir(v) => v.set_times(atim, mtim),
+        }
+    }
+
+    pub(crate) async fn set_times_at(
+        &self,
+        path_flags: types::PathFlags,
+        path: String,
+        atim: types::NewTimestamp,
+        mtim: types::NewTimestamp,
+    ) -> FsResult<()> {
+        match self.match_preopen(path)? {
+            PreopenMatch::Exact(child) => child.set_times(atim, mtim).await,
+            PreopenMatch::Partial { dir, path } => {
+                dir.set_times_at(path_flags, path, atim, mtim).await
+            }
+        }
+    }
+
+    pub(crate) async fn read_directory(&self) -> FsResult<ReaddirIterator> {
+        match self {
+            Descriptor::File(_) => Err(types::ErrorCode::NotDirectory.into()),
+            Descriptor::Dir(d) => d.read_directory().await,
+            Descriptor::VDir(v) => v.read_directory().await,
+        }
+    }
+
+    pub(crate) async fn sync(&self) -> FsResult<()> {
+        match self {
+            Descriptor::File(f) => f.sync().await,
+            Descriptor::Dir(d) => d.sync().await,
+            Descriptor::VDir(v) => v.sync(),
+        }
+    }
+
+    pub(crate) async fn create_directory_at(&self, path: String) -> FsResult<()> {
+        let (dir, path) = self.match_preopened_dir(path)?;
+
+        dir.create_directory_at(path).await
+    }
+
+    pub(crate) async fn stat(&self) -> FsResult<types::DescriptorStat> {
+        match self {
+            Descriptor::File(f) => f.stat().await,
+            Descriptor::Dir(d) => d.stat().await,
+            Descriptor::VDir(v) => v.stat(),
+        }
+    }
+
+    pub(crate) async fn stat_at(
+        &self,
+        path_flags: types::PathFlags,
+        path: String,
+    ) -> FsResult<types::DescriptorStat> {
+        match self.match_preopen(path)? {
+            PreopenMatch::Exact(child) => child.stat().await,
+            PreopenMatch::Partial { dir, path } => dir.stat_at(path_flags, path).await,
+        }
+    }
+
+    pub(crate) async fn link_at(
+        old_descriptor: &Descriptor,
+        // TODO delete the path flags from this function
+        old_path_flags: types::PathFlags,
+        old_path: String,
+        new_descriptor: &Descriptor,
+        new_path: String,
+    ) -> FsResult<()> {
+        let (old_dir, old_path) = old_descriptor.match_preopened_dir(old_path)?;
+        let (new_dir, new_path) = new_descriptor.match_preopened_dir(new_path)?;
+
+        Dir::link_at(old_dir, old_path_flags, old_path, new_dir, new_path).await
+    }
+
+    pub(crate) async fn open_at(
+        &self,
+        path_flags: types::PathFlags,
+        path: String,
+        oflags: types::OpenFlags,
+        flags: types::DescriptorFlags,
+    ) -> FsResult<types::Descriptor> {
+        match self.match_preopen(path)? {
+            PreopenMatch::Exact(descriptor) => Ok(descriptor.clone()),
+            PreopenMatch::Partial { dir, path } => {
+                dir.open_at(path_flags, path, oflags, flags).await
+            }
+        }
+    }
+
+    pub(crate) async fn readlink_at(&self, path: String) -> FsResult<String> {
+        match self.match_preopen(path)? {
+            PreopenMatch::Exact(_) => Err(ErrorCode::Invalid.into()),
+            PreopenMatch::Partial { dir, path } => dir.readlink_at(path).await,
+        }
+    }
+
+    pub(crate) async fn remove_directory_at(&self, path: String) -> FsResult<()> {
+        match self.match_preopen(path)? {
+            PreopenMatch::Exact(_) => Err(ErrorCode::NotPermitted.into()),
+            PreopenMatch::Partial { dir, path } => dir.remove_directory_at(path).await,
+        }
+    }
+
+    pub(crate) async fn rename_at(
+        old_fd: &Descriptor,
+        old_path: String,
+        new_fd: &Descriptor,
+        new_path: String,
+    ) -> FsResult<()> {
+        let (old_dir, old_path) = old_fd.match_preopened_dir(old_path)?;
+        let (new_dir, new_path) = new_fd.match_preopened_dir(new_path)?;
+
+        Dir::rename_at(old_dir, old_path, new_dir, new_path).await
+    }
+
+    pub(crate) async fn symlink_at(&self, src_path: String, dest_path: String) -> FsResult<()> {
+        let (src_dir, src_path) = self.match_preopened_dir(src_path)?;
+        let (dest_dir, dest_path) = self.match_preopened_dir(dest_path)?;
+
+        // Only allow the creation of symlinks within the same physical preopen.
+        if Dir::is_same_object(src_dir, dest_dir).await? == false {
+            return Err(ErrorCode::NotPermitted.into());
+        }
+
+        src_dir.symlink_at(src_path, dest_path).await
+    }
+
+    pub(crate) async fn unlink_file_at(&self, path: String) -> FsResult<()> {
+        let (dir, path) = self.match_preopened_dir(path)?;
+
+        dir.unlink_file_at(path).await
+    }
+
+    pub(crate) async fn read(
+        &self,
+        len: types::Filesize,
+        offset: types::Filesize,
+    ) -> FsResult<(Vec<u8>, bool)> {
+        self.file()?.read(len, offset).await
+    }
+
+    pub(crate) async fn write(
+        &self,
+        buf: Vec<u8>,
+        offset: types::Filesize,
+    ) -> FsResult<types::Filesize> {
+        self.file()?.write(buf, offset).await
+    }
+
+    pub(crate) fn read_via_stream(&self, offset: types::Filesize) -> FsResult<InputStream> {
+        self.file()?.read_via_stream(offset)
+    }
+
+    pub(crate) fn write_via_stream(&self, offset: types::Filesize) -> FsResult<OutputStream> {
+        self.file()?.write_via_stream(offset)
+    }
+
+    pub(crate) fn append_via_stream(&self) -> FsResult<OutputStream> {
+        self.file()?.append_via_stream()
+    }
+
+    pub(crate) async fn is_same_object(a: &Descriptor, b: &Descriptor) -> anyhow::Result<bool> {
+        match (a, b) {
+            (Descriptor::File(a), Descriptor::File(b)) => Ok(File::is_same_object(a, b).await?),
+            (Descriptor::Dir(a), Descriptor::Dir(b)) => Ok(Dir::is_same_object(a, b).await?),
+            (Descriptor::VDir(a), Descriptor::VDir(b)) => Ok(VDir::is_same_object(a, b)),
+            (_, _) => Ok(false),
+        }
+    }
+    pub(crate) async fn metadata_hash(&self) -> FsResult<types::MetadataHashValue> {
+        match self {
+            Descriptor::File(f) => f.metadata_hash().await,
+            Descriptor::Dir(d) => d.metadata_hash().await,
+            Descriptor::VDir(v) => v.metadata_hash(),
+        }
+    }
+    pub(crate) async fn metadata_hash_at(
+        &self,
+        path_flags: types::PathFlags,
+        path: String,
+    ) -> FsResult<types::MetadataHashValue> {
+        match self.match_preopen(path)? {
+            PreopenMatch::Exact(child) => child.metadata_hash().await,
+            PreopenMatch::Partial {
+                dir: base_dir,
+                path: child_path,
+            } => base_dir.metadata_hash_at(path_flags, child_path).await,
+        }
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct FilePerms: usize {
+        const READ = 0b1;
+        const WRITE = 0b10;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct OpenMode: usize {
+        const READ = 0b1;
+        const WRITE = 0b10;
+    }
+}
+
+#[derive(Clone)]
+pub struct File {
+    /// The operating system File this struct is mediating access to.
+    ///
+    /// Wrapped in an Arc because the same underlying file is used for
+    /// implementing the stream types. A copy is also needed for
+    /// [`spawn_blocking`].
+    ///
+    /// [`spawn_blocking`]: Self::spawn_blocking
+    pub file: Arc<cap_std::fs::File>,
+    /// Permissions to enforce on access to the file. These permissions are
+    /// specified by a user of the `crate::WasiCtxBuilder`, and are
+    /// enforced prior to any enforced by the underlying operating system.
+    pub perms: FilePerms,
+    /// The mode the file was opened under: bits for reading, and writing.
+    /// Required to correctly report the DescriptorFlags, because cap-std
+    /// doesn't presently provide a cross-platform equivalent of reading the
+    /// oflags back out using fcntl.
+    pub open_mode: OpenMode,
+
+    allow_blocking_current_thread: bool,
+}
+
+impl File {
+    pub fn new(
+        file: cap_std::fs::File,
+        perms: FilePerms,
+        open_mode: OpenMode,
+        allow_blocking_current_thread: bool,
+    ) -> Self {
+        Self {
+            file: Arc::new(file),
+            perms,
+            open_mode,
+            allow_blocking_current_thread,
+        }
+    }
+
+    async fn advise(
         &self,
         offset: types::Filesize,
         len: types::Filesize,
@@ -77,136 +404,73 @@ impl Descriptor {
             Advice::NoReuse => A::NoReuse,
         };
 
-        let f = self.file()?;
-        f.spawn_blocking(move |f| f.advise(offset, len, advice))
+        self.spawn_blocking(move |f| f.advise(offset, len, advice))
             .await?;
         Ok(())
     }
 
-    pub(crate) async fn sync_data(&self) -> FsResult<()> {
-        let descriptor = self;
-
-        match descriptor {
-            Descriptor::File(f) => {
-                match f.spawn_blocking(|f| f.sync_data()).await {
-                    Ok(()) => Ok(()),
-                    // On windows, `sync_data` uses `FileFlushBuffers` which fails with
-                    // `ERROR_ACCESS_DENIED` if the file is not upen for writing. Ignore
-                    // this error, for POSIX compatibility.
-                    #[cfg(windows)]
-                    Err(e)
-                        if e.raw_os_error()
-                            == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
-                    {
-                        Ok(())
-                    }
-                    Err(e) => Err(e.into()),
-                }
+    async fn sync_data(&self) -> FsResult<()> {
+        match self.spawn_blocking(|f| f.sync_data()).await {
+            Ok(()) => Ok(()),
+            // On windows, `sync_data` uses `FileFlushBuffers` which fails with
+            // `ERROR_ACCESS_DENIED` if the file is not upen for writing. Ignore
+            // this error, for POSIX compatibility.
+            #[cfg(windows)]
+            Err(e)
+                if e.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
+            {
+                Ok(())
             }
-            Descriptor::Dir(d) => {
-                d.spawn_blocking(|d| Ok(d.open(std::path::Component::CurDir)?.sync_data()?))
-                    .await
-            }
+            Err(e) => Err(e.into()),
         }
     }
 
-    pub(crate) async fn get_flags(&self) -> FsResult<types::DescriptorFlags> {
-        use system_interface::fs::{FdFlags, GetSetFdFlags};
+    async fn get_flags(&self) -> FsResult<types::DescriptorFlags> {
+        use system_interface::fs::GetSetFdFlags;
         use types::DescriptorFlags;
 
-        fn get_from_fdflags(flags: FdFlags) -> DescriptorFlags {
-            let mut out = DescriptorFlags::empty();
-            if flags.contains(FdFlags::DSYNC) {
-                out |= DescriptorFlags::REQUESTED_WRITE_SYNC;
-            }
-            if flags.contains(FdFlags::RSYNC) {
-                out |= DescriptorFlags::DATA_INTEGRITY_SYNC;
-            }
-            if flags.contains(FdFlags::SYNC) {
-                out |= DescriptorFlags::FILE_INTEGRITY_SYNC;
-            }
-            out
+        let flags = self.spawn_blocking(|f| f.get_fd_flags()).await?;
+        let mut flags = descriptor_flags_from_fdflags(flags);
+        if self.open_mode.contains(OpenMode::READ) {
+            flags |= DescriptorFlags::READ;
         }
-
-        let descriptor = self;
-        match descriptor {
-            Descriptor::File(f) => {
-                let flags = f.spawn_blocking(|f| f.get_fd_flags()).await?;
-                let mut flags = get_from_fdflags(flags);
-                if f.open_mode.contains(OpenMode::READ) {
-                    flags |= DescriptorFlags::READ;
-                }
-                if f.open_mode.contains(OpenMode::WRITE) {
-                    flags |= DescriptorFlags::WRITE;
-                }
-                Ok(flags)
-            }
-            Descriptor::Dir(d) => {
-                let flags = d.spawn_blocking(|d| d.get_fd_flags()).await?;
-                let mut flags = get_from_fdflags(flags);
-                if d.open_mode.contains(OpenMode::READ) {
-                    flags |= DescriptorFlags::READ;
-                }
-                if d.open_mode.contains(OpenMode::WRITE) {
-                    flags |= DescriptorFlags::MUTATE_DIRECTORY;
-                }
-                Ok(flags)
-            }
+        if self.open_mode.contains(OpenMode::WRITE) {
+            flags |= DescriptorFlags::WRITE;
         }
+        Ok(flags)
     }
 
-    pub(crate) async fn get_type(&self) -> FsResult<types::DescriptorType> {
-        let descriptor = self;
-
-        match descriptor {
-            Descriptor::File(f) => {
-                let meta = f.spawn_blocking(|f| f.metadata()).await?;
-                Ok(Self::descriptortype_from(meta.file_type()))
-            }
-            Descriptor::Dir(_) => Ok(types::DescriptorType::Directory),
-        }
+    async fn get_type(&self) -> FsResult<types::DescriptorType> {
+        let meta = self.spawn_blocking(|f| f.metadata()).await?;
+        Ok(descriptortype_from(meta.file_type()))
     }
 
-    pub(crate) async fn set_size(&self, size: types::Filesize) -> FsResult<()> {
-        let f = self.file()?;
-        if !f.perms.contains(FilePerms::WRITE) {
+    async fn set_size(&self, size: types::Filesize) -> FsResult<()> {
+        if !self.perms.contains(FilePerms::WRITE) {
             Err(ErrorCode::NotPermitted)?;
         }
-        f.spawn_blocking(move |f| f.set_len(size)).await?;
+        self.spawn_blocking(move |f| f.set_len(size)).await?;
         Ok(())
     }
 
-    pub(crate) async fn set_times(
+    async fn set_times(
         &self,
         atim: types::NewTimestamp,
         mtim: types::NewTimestamp,
     ) -> FsResult<()> {
         use fs_set_times::SetTimes;
 
-        let descriptor = self;
-        match descriptor {
-            Descriptor::File(f) => {
-                if !f.perms.contains(FilePerms::WRITE) {
-                    return Err(ErrorCode::NotPermitted.into());
-                }
-                let atim = Self::systemtimespec_from(atim)?;
-                let mtim = Self::systemtimespec_from(mtim)?;
-                f.spawn_blocking(|f| f.set_times(atim, mtim)).await?;
-                Ok(())
-            }
-            Descriptor::Dir(d) => {
-                if !d.perms.contains(DirPerms::MUTATE) {
-                    return Err(ErrorCode::NotPermitted.into());
-                }
-                let atim = Self::systemtimespec_from(atim)?;
-                let mtim = Self::systemtimespec_from(mtim)?;
-                d.spawn_blocking(|d| d.set_times(atim, mtim)).await?;
-                Ok(())
-            }
+        if !self.perms.contains(FilePerms::WRITE) {
+            return Err(ErrorCode::NotPermitted.into());
         }
+        let atim = systemtimespec_from(atim)?;
+        let mtim = systemtimespec_from(mtim)?;
+        self.spawn_blocking(|f| f.set_times(atim, mtim)).await?;
+        Ok(())
     }
 
-    pub(crate) async fn read(
+    async fn read(
         &self,
         len: types::Filesize,
         offset: types::Filesize,
@@ -214,12 +478,11 @@ impl Descriptor {
         use std::io::IoSliceMut;
         use system_interface::fs::FileIoExt;
 
-        let f = self.file()?;
-        if !f.perms.contains(FilePerms::READ) {
+        if !self.perms.contains(FilePerms::READ) {
             return Err(ErrorCode::NotPermitted.into());
         }
 
-        let (mut buffer, r) = f
+        let (mut buffer, r) = self
             .spawn_blocking(move |f| {
                 let mut buffer = vec![0; len.try_into().unwrap_or(usize::MAX)];
                 let r = f.read_vectored_at(&mut [IoSliceMut::new(&mut buffer)], offset);
@@ -241,29 +504,228 @@ impl Descriptor {
         Ok((buffer, state))
     }
 
-    pub(crate) async fn write(
-        &self,
-        buf: Vec<u8>,
-        offset: types::Filesize,
-    ) -> FsResult<types::Filesize> {
+    async fn write(&self, buf: Vec<u8>, offset: types::Filesize) -> FsResult<types::Filesize> {
         use std::io::IoSlice;
         use system_interface::fs::FileIoExt;
 
-        let f = self.file()?;
-        if !f.perms.contains(FilePerms::WRITE) {
+        if !self.perms.contains(FilePerms::WRITE) {
             return Err(ErrorCode::NotPermitted.into());
         }
 
-        let bytes_written = f
+        let bytes_written = self
             .spawn_blocking(move |f| f.write_vectored_at(&[IoSlice::new(&buf)], offset))
             .await?;
 
         Ok(types::Filesize::try_from(bytes_written).expect("usize fits in Filesize"))
     }
 
-    pub(crate) async fn read_directory(&self) -> FsResult<ReaddirIterator> {
-        let d = self.dir()?;
-        if !d.perms.contains(DirPerms::READ) {
+    async fn sync(&self) -> FsResult<()> {
+        match self.spawn_blocking(|f| f.sync_all()).await {
+            Ok(()) => Ok(()),
+            // On windows, `sync_data` uses `FileFlushBuffers` which fails with
+            // `ERROR_ACCESS_DENIED` if the file is not upen for writing. Ignore
+            // this error, for POSIX compatibility.
+            #[cfg(windows)]
+            Err(e)
+                if e.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn read_via_stream(&self, offset: types::Filesize) -> FsResult<InputStream> {
+        if !self.perms.contains(FilePerms::READ) {
+            Err(types::ErrorCode::BadDescriptor)?;
+        }
+
+        // Create a stream view for it.
+        let reader = FileInputStream::new(self, offset);
+
+        Ok(InputStream::File(reader))
+    }
+
+    fn write_via_stream(&self, offset: types::Filesize) -> FsResult<OutputStream> {
+        if !self.perms.contains(FilePerms::WRITE) {
+            Err(types::ErrorCode::BadDescriptor)?;
+        }
+
+        // Create a stream view for it.
+        let writer = FileOutputStream::write_at(self, offset);
+        Ok(Box::new(writer))
+    }
+
+    fn append_via_stream(&self) -> FsResult<OutputStream> {
+        if !self.perms.contains(FilePerms::WRITE) {
+            Err(types::ErrorCode::BadDescriptor)?;
+        }
+
+        // Create a stream view for it.
+        let appender = FileOutputStream::append(self);
+
+        Ok(Box::new(appender))
+    }
+
+    async fn stat(&self) -> FsResult<types::DescriptorStat> {
+        // No permissions check on stat: if opened, allowed to stat it
+        let meta = self.spawn_blocking(|f| f.metadata()).await?;
+        Ok(descriptorstat_from(meta))
+    }
+
+    /// Spawn a task on tokio's blocking thread for performing blocking
+    /// syscalls on the underlying [`cap_std::fs::File`].
+    pub(crate) async fn spawn_blocking<F, R>(&self, body: F) -> R
+    where
+        F: FnOnce(&cap_std::fs::File) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        match self._spawn_blocking(body) {
+            SpawnBlocking::Done(result) => result,
+            SpawnBlocking::Spawned(task) => task.await,
+        }
+    }
+
+    async fn is_same_object(a: &File, b: &File) -> FsResult<bool> {
+        // Short circuit if they're the same object in memory.
+        if Arc::ptr_eq(&a.file, &b.file) {
+            return Ok(true);
+        }
+
+        let id_a = a.get_id().await?;
+        let id_b = b.get_id().await?;
+
+        Ok(id_a == id_b)
+    }
+
+    async fn get_id(&self) -> FsResult<FileId> {
+        // No permissions check on metadata: if opened, allowed to stat it
+        let meta = self
+            .spawn_blocking(|f| f.metadata())
+            .await
+            .map_err(|err| FsError::trap(err))?;
+        Ok(FileId::from_metadata(&meta))
+    }
+
+    async fn metadata_hash(&self) -> FsResult<types::MetadataHashValue> {
+        Ok(self.get_id().await?.hash())
+    }
+
+    /// Returns `Some` when the current thread is allowed to block in filesystem
+    /// operations, and otherwise returns `None` to indicate that
+    /// `spawn_blocking` must be used.
+    pub(crate) fn as_blocking_file(&self) -> Option<&cap_std::fs::File> {
+        if self.allow_blocking_current_thread {
+            Some(&self.file)
+        } else {
+            None
+        }
+    }
+
+    fn _spawn_blocking<F, R>(&self, body: F) -> SpawnBlocking<R>
+    where
+        F: FnOnce(&cap_std::fs::File) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        match self.as_blocking_file() {
+            Some(file) => SpawnBlocking::Done(body(file)),
+            None => {
+                let f = self.file.clone();
+                SpawnBlocking::Spawned(spawn_blocking(move || body(&f)))
+            }
+        }
+    }
+}
+
+enum SpawnBlocking<T> {
+    Done(T),
+    Spawned(AbortOnDropJoinHandle<T>),
+}
+
+bitflags::bitflags! {
+    /// Permission bits for operating on a directory.
+    ///
+    /// Directories can be limited to being readonly. This will restrict what
+    /// can be done with them, for example preventing creation of new files.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct DirPerms: usize {
+        /// This directory can be read, for example its entries can be iterated
+        /// over and files can be opened.
+        const READ = 0b1;
+
+        /// This directory can be mutated, for example by creating new files
+        /// within it.
+        const MUTATE = 0b10;
+    }
+}
+
+#[derive(Clone)]
+pub struct Dir {
+    /// The operating system file descriptor this struct is mediating access
+    /// to.
+    ///
+    /// Wrapped in an Arc because a copy is needed for [`spawn_blocking`].
+    ///
+    /// [`spawn_blocking`]: Self::spawn_blocking
+    pub dir: Arc<cap_std::fs::Dir>,
+    /// Permissions to enforce on access to this directory. These permissions
+    /// are specified by a user of the `crate::WasiCtxBuilder`, and
+    /// are enforced prior to any enforced by the underlying operating system.
+    ///
+    /// These permissions are also enforced on any directories opened under
+    /// this directory.
+    pub perms: DirPerms,
+    /// Permissions to enforce on any files opened under this directory.
+    pub file_perms: FilePerms,
+    /// The mode the directory was opened under: bits for reading, and writing.
+    /// Required to correctly report the DescriptorFlags, because cap-std
+    /// doesn't presently provide a cross-platform equivalent of reading the
+    /// oflags back out using fcntl.
+    pub open_mode: OpenMode,
+
+    allow_blocking_current_thread: bool,
+}
+
+impl Dir {
+    pub fn new(
+        dir: cap_std::fs::Dir,
+        perms: DirPerms,
+        file_perms: FilePerms,
+        open_mode: OpenMode,
+        allow_blocking_current_thread: bool,
+    ) -> Self {
+        Dir {
+            dir: Arc::new(dir),
+            perms,
+            file_perms,
+            open_mode,
+            allow_blocking_current_thread,
+        }
+    }
+
+    async fn sync_data(&self) -> FsResult<()> {
+        self.spawn_blocking(|d| Ok(d.open(std::path::Component::CurDir)?.sync_data()?))
+            .await
+    }
+
+    async fn get_flags(&self) -> FsResult<types::DescriptorFlags> {
+        use system_interface::fs::GetSetFdFlags;
+        use types::DescriptorFlags;
+
+        let flags = self.spawn_blocking(|d| d.get_fd_flags()).await?;
+        let mut flags = descriptor_flags_from_fdflags(flags);
+        if self.open_mode.contains(OpenMode::READ) {
+            flags |= DescriptorFlags::READ;
+        }
+        if self.open_mode.contains(OpenMode::WRITE) {
+            flags |= DescriptorFlags::MUTATE_DIRECTORY;
+        }
+        Ok(flags)
+    }
+
+    async fn read_directory(&self) -> FsResult<ReaddirIterator> {
+        if !self.perms.contains(DirPerms::READ) {
             return Err(ErrorCode::NotPermitted.into());
         }
 
@@ -277,7 +739,7 @@ impl Descriptor {
             }
         }
 
-        let entries = d
+        let entries = self
             .spawn_blocking(|d| {
                 // Both `entries` and `metadata` perform syscalls, which is why they are done
                 // within this `block` call, rather than delay calculating the metadata
@@ -287,7 +749,7 @@ impl Descriptor {
                         .map(|entry| {
                             let entry = entry?;
                             let meta = entry.metadata()?;
-                            let type_ = Self::descriptortype_from(meta.file_type());
+                            let type_ = descriptortype_from(meta.file_type());
                             let name = entry
                                 .file_name()
                                 .into_string()
@@ -322,74 +784,61 @@ impl Descriptor {
         Ok(ReaddirIterator::new(entries))
     }
 
-    pub(crate) async fn sync(&self) -> FsResult<()> {
-        match self {
-            Descriptor::File(f) => {
-                match f.spawn_blocking(|f| f.sync_all()).await {
-                    Ok(()) => Ok(()),
-                    // On windows, `sync_data` uses `FileFlushBuffers` which fails with
-                    // `ERROR_ACCESS_DENIED` if the file is not upen for writing. Ignore
-                    // this error, for POSIX compatibility.
-                    #[cfg(windows)]
-                    Err(e)
-                        if e.raw_os_error()
-                            == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
-                    {
-                        Ok(())
-                    }
-                    Err(e) => Err(e.into()),
-                }
-            }
-            Descriptor::Dir(d) => {
-                d.spawn_blocking(|d| Ok(d.open(std::path::Component::CurDir)?.sync_all()?))
-                    .await
-            }
-        }
+    async fn sync(&self) -> FsResult<()> {
+        self.spawn_blocking(|d| Ok(d.open(std::path::Component::CurDir)?.sync_all()?))
+            .await
     }
 
-    pub(crate) async fn create_directory_at(&self, path: String) -> FsResult<()> {
-        let d = self.dir()?;
-        if !d.perms.contains(DirPerms::MUTATE) {
+    async fn create_directory_at(&self, path: String) -> FsResult<()> {
+        if !self.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        d.spawn_blocking(move |d| d.create_dir(&path)).await?;
+        self.spawn_blocking(move |d| d.create_dir(&path)).await?;
         Ok(())
     }
 
-    pub(crate) async fn stat(&self) -> FsResult<types::DescriptorStat> {
-        match self {
-            Descriptor::File(f) => {
-                // No permissions check on stat: if opened, allowed to stat it
-                let meta = f.spawn_blocking(|f| f.metadata()).await?;
-                Ok(Self::descriptorstat_from(meta))
-            }
-            Descriptor::Dir(d) => {
-                // No permissions check on stat: if opened, allowed to stat it
-                let meta = d.spawn_blocking(|d| d.dir_metadata()).await?;
-                Ok(Self::descriptorstat_from(meta))
-            }
-        }
+    async fn stat(&self) -> FsResult<types::DescriptorStat> {
+        // No permissions check on stat: if opened, allowed to stat it
+        let meta = self.spawn_blocking(|d| d.dir_metadata()).await?;
+        Ok(descriptorstat_from(meta))
     }
 
-    pub(crate) async fn stat_at(
+    async fn stat_at(
         &self,
         path_flags: types::PathFlags,
         path: String,
     ) -> FsResult<types::DescriptorStat> {
-        let d = self.dir()?;
-        if !d.perms.contains(DirPerms::READ) {
+        if !self.perms.contains(DirPerms::READ) {
             return Err(ErrorCode::NotPermitted.into());
         }
 
         let meta = if Self::symlink_follow(path_flags) {
-            d.spawn_blocking(move |d| d.metadata(&path)).await?
+            self.spawn_blocking(move |d| d.metadata(&path)).await?
         } else {
-            d.spawn_blocking(move |d| d.symlink_metadata(&path)).await?
+            self.spawn_blocking(move |d| d.symlink_metadata(&path))
+                .await?
         };
-        Ok(Self::descriptorstat_from(meta))
+
+        Ok(descriptorstat_from(meta))
     }
 
-    pub(crate) async fn set_times_at(
+    async fn set_times(
+        &self,
+        atim: types::NewTimestamp,
+        mtim: types::NewTimestamp,
+    ) -> FsResult<()> {
+        use fs_set_times::SetTimes;
+
+        if !self.perms.contains(DirPerms::MUTATE) {
+            return Err(ErrorCode::NotPermitted.into());
+        }
+        let atim = systemtimespec_from(atim)?;
+        let mtim = systemtimespec_from(mtim)?;
+        self.spawn_blocking(|d| d.set_times(atim, mtim)).await?;
+        Ok(())
+    }
+
+    async fn set_times_at(
         &self,
         path_flags: types::PathFlags,
         path: String,
@@ -398,14 +847,13 @@ impl Descriptor {
     ) -> FsResult<()> {
         use cap_fs_ext::DirExt;
 
-        let d = self.dir()?;
-        if !d.perms.contains(DirPerms::MUTATE) {
+        if !self.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        let atim = Self::systemtimespec_from(atim)?;
-        let mtim = Self::systemtimespec_from(mtim)?;
+        let atim = systemtimespec_from(atim)?;
+        let mtim = systemtimespec_from(mtim)?;
         if Self::symlink_follow(path_flags) {
-            d.spawn_blocking(move |d| {
+            self.spawn_blocking(move |d| {
                 d.set_times(
                     &path,
                     atim.map(cap_fs_ext::SystemTimeSpec::from_std),
@@ -414,7 +862,7 @@ impl Descriptor {
             })
             .await?;
         } else {
-            d.spawn_blocking(move |d| {
+            self.spawn_blocking(move |d| {
                 d.set_symlink_times(
                     &path,
                     atim.map(cap_fs_ext::SystemTimeSpec::from_std),
@@ -426,19 +874,17 @@ impl Descriptor {
         Ok(())
     }
 
-    pub(crate) async fn link_at(
-        &self,
+    async fn link_at(
+        old_dir: &Dir,
         // TODO delete the path flags from this function
         old_path_flags: types::PathFlags,
         old_path: String,
-        new_descriptor: &Descriptor,
+        new_dir: &Dir,
         new_path: String,
     ) -> FsResult<()> {
-        let old_dir = self.dir()?;
         if !old_dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        let new_dir = new_descriptor.dir()?;
         if !new_dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
@@ -452,7 +898,7 @@ impl Descriptor {
         Ok(())
     }
 
-    pub(crate) async fn open_at(
+    async fn open_at(
         &self,
         path_flags: types::PathFlags,
         path: String,
@@ -463,12 +909,11 @@ impl Descriptor {
         use system_interface::fs::{FdFlags, GetSetFdFlags};
         use types::{DescriptorFlags, OpenFlags};
 
-        let d = self.dir()?;
-        if !d.perms.contains(DirPerms::READ) {
+        if !self.perms.contains(DirPerms::READ) {
             Err(ErrorCode::NotPermitted)?;
         }
 
-        if !d.perms.contains(DirPerms::MUTATE) {
+        if !self.perms.contains(DirPerms::MUTATE) {
             if oflags.contains(OpenFlags::CREATE) || oflags.contains(OpenFlags::TRUNCATE) {
                 Err(ErrorCode::NotPermitted)?;
             }
@@ -537,10 +982,10 @@ impl Descriptor {
 
         // Now enforce this WasiCtx's permissions before letting the OS have
         // its shot:
-        if !d.perms.contains(DirPerms::MUTATE) && create {
+        if !self.perms.contains(DirPerms::MUTATE) && create {
             Err(ErrorCode::NotPermitted)?;
         }
-        if !d.file_perms.contains(FilePerms::WRITE) && open_mode.contains(OpenMode::WRITE) {
+        if !self.file_perms.contains(FilePerms::WRITE) && open_mode.contains(OpenMode::WRITE) {
             Err(ErrorCode::NotPermitted)?;
         }
 
@@ -553,7 +998,7 @@ impl Descriptor {
             NotDir,
         }
 
-        let opened = d
+        let opened = self
             .spawn_blocking::<_, std::io::Result<OpenResult>>(move |d| {
                 let mut opened = d.open_with(&path, &opts)?;
                 if opened.metadata()?.is_dir() {
@@ -573,56 +1018,52 @@ impl Descriptor {
             .await?;
 
         match opened {
-            OpenResult::Dir(dir) => Ok(Descriptor::Dir(RealDir::new(
+            OpenResult::Dir(dir) => Ok(Descriptor::Dir(Dir::new(
                 dir,
-                d.perms,
-                d.file_perms,
+                self.perms,
+                self.file_perms,
                 open_mode,
-                d.allow_blocking_current_thread,
+                self.allow_blocking_current_thread,
             ))),
 
             OpenResult::File(file) => Ok(Descriptor::File(File::new(
                 file,
-                d.file_perms,
+                self.file_perms,
                 open_mode,
-                d.allow_blocking_current_thread,
+                self.allow_blocking_current_thread,
             ))),
 
             OpenResult::NotDir => Err(ErrorCode::NotDirectory.into()),
         }
     }
 
-    pub(crate) async fn readlink_at(&self, path: String) -> FsResult<String> {
-        let d = self.dir()?;
-        if !d.perms.contains(DirPerms::READ) {
+    async fn readlink_at(&self, path: String) -> FsResult<String> {
+        if !self.perms.contains(DirPerms::READ) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        let link = d.spawn_blocking(move |d| d.read_link(&path)).await?;
+        let link = self.spawn_blocking(move |d| d.read_link(&path)).await?;
         Ok(link
             .into_os_string()
             .into_string()
             .map_err(|_| ErrorCode::IllegalByteSequence)?)
     }
 
-    pub(crate) async fn remove_directory_at(&self, path: String) -> FsResult<()> {
-        let d = self.dir()?;
-        if !d.perms.contains(DirPerms::MUTATE) {
+    async fn remove_directory_at(&self, path: String) -> FsResult<()> {
+        if !self.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        Ok(d.spawn_blocking(move |d| d.remove_dir(&path)).await?)
+        Ok(self.spawn_blocking(move |d| d.remove_dir(&path)).await?)
     }
 
-    pub(crate) async fn rename_at(
-        &self,
+    async fn rename_at(
+        old_dir: &Dir,
         old_path: String,
-        new_fd: &Descriptor,
+        new_dir: &Dir,
         new_path: String,
     ) -> FsResult<()> {
-        let old_dir = self.dir()?;
         if !old_dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        let new_dir = new_fd.dir()?;
         if !new_dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
@@ -632,105 +1073,62 @@ impl Descriptor {
             .await?)
     }
 
-    pub(crate) async fn symlink_at(&self, src_path: String, dest_path: String) -> FsResult<()> {
+    async fn symlink_at(&self, src_path: String, dest_path: String) -> FsResult<()> {
         // On windows, Dir.symlink is provided by DirExt
         #[cfg(windows)]
         use cap_fs_ext::DirExt;
 
-        let d = self.dir()?;
-        if !d.perms.contains(DirPerms::MUTATE) {
+        if !self.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        Ok(d.spawn_blocking(move |d| d.symlink(&src_path, &dest_path))
+        Ok(self
+            .spawn_blocking(move |d| d.symlink(&src_path, &dest_path))
             .await?)
     }
 
-    pub(crate) async fn unlink_file_at(&self, path: String) -> FsResult<()> {
+    async fn unlink_file_at(&self, path: String) -> FsResult<()> {
         use cap_fs_ext::DirExt;
 
-        let d = self.dir()?;
-        if !d.perms.contains(DirPerms::MUTATE) {
+        if !self.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        Ok(d.spawn_blocking(move |d| d.remove_file_or_symlink(&path))
+        Ok(self
+            .spawn_blocking(move |d| d.remove_file_or_symlink(&path))
             .await?)
     }
 
-    pub(crate) fn read_via_stream(&self, offset: types::Filesize) -> FsResult<InputStream> {
-        // Trap if fd lookup fails:
-        let f = self.file()?;
-
-        if !f.perms.contains(FilePerms::READ) {
-            Err(types::ErrorCode::BadDescriptor)?;
+    async fn is_same_object(a: &Dir, b: &Dir) -> FsResult<bool> {
+        // Short circuit if they're the same object in memory.
+        if Arc::ptr_eq(&a.dir, &b.dir) {
+            return Ok(true);
         }
 
-        // Create a stream view for it.
-        let reader = FileInputStream::new(f, offset);
+        let id_a = a.get_id().await?;
+        let id_b = b.get_id().await?;
 
-        Ok(InputStream::File(reader))
+        Ok(id_a == id_b)
     }
 
-    pub(crate) fn write_via_stream(&self, offset: types::Filesize) -> FsResult<OutputStream> {
-        // Trap if fd lookup fails:
-        let f = self.file()?;
-
-        if !f.perms.contains(FilePerms::WRITE) {
-            Err(types::ErrorCode::BadDescriptor)?;
-        }
-
-        // Create a stream view for it.
-        let writer = FileOutputStream::write_at(f, offset);
-        Ok(Box::new(writer))
+    async fn get_id(&self) -> FsResult<FileId> {
+        // No permissions check on metadata: if opened, allowed to stat it
+        let meta = self
+            .spawn_blocking(|d| d.dir_metadata())
+            .await
+            .map_err(|err| FsError::trap(err))?;
+        Ok(FileId::from_metadata(&meta))
     }
 
-    pub(crate) fn append_via_stream(&self) -> FsResult<OutputStream> {
-        // Trap if fd lookup fails:
-        let f = self.file()?;
-
-        if !f.perms.contains(FilePerms::WRITE) {
-            Err(types::ErrorCode::BadDescriptor)?;
-        }
-
-        // Create a stream view for it.
-        let appender = FileOutputStream::append(f);
-
-        Ok(Box::new(appender))
+    async fn metadata_hash(&self) -> FsResult<types::MetadataHashValue> {
+        Ok(self.get_id().await?.hash())
     }
 
-    pub(crate) async fn is_same_object(a: &Descriptor, b: &Descriptor) -> anyhow::Result<bool> {
-        use cap_fs_ext::MetadataExt;
-        let meta_a = Self::get_descriptor_metadata(a).await?;
-        let meta_b = Self::get_descriptor_metadata(b).await?;
-        if meta_a.dev() == meta_b.dev() && meta_a.ino() == meta_b.ino() {
-            // MetadataHashValue does not derive eq, so use a pair of
-            // comparisons to check equality:
-            debug_assert_eq!(
-                Self::calculate_metadata_hash(&meta_a).upper,
-                Self::calculate_metadata_hash(&meta_b).upper
-            );
-            debug_assert_eq!(
-                Self::calculate_metadata_hash(&meta_a).lower,
-                Self::calculate_metadata_hash(&meta_b).lower
-            );
-            Ok(true)
-        } else {
-            // Hash collisions are possible, so don't assert the negative here
-            Ok(false)
-        }
-    }
-    pub(crate) async fn metadata_hash(&self) -> FsResult<types::MetadataHashValue> {
-        let descriptor_a = self;
-        let meta = Self::get_descriptor_metadata(descriptor_a).await?;
-        Ok(Self::calculate_metadata_hash(&meta))
-    }
     pub(crate) async fn metadata_hash_at(
         &self,
         path_flags: types::PathFlags,
         path: String,
     ) -> FsResult<types::MetadataHashValue> {
-        let d = self.dir()?;
         // No permissions check on metadata: if dir opened, allowed to stat it
-        let meta = d
+        let meta = self
             .spawn_blocking(move |d| {
                 if Self::symlink_follow(path_flags) {
                     d.metadata(path)
@@ -739,278 +1137,12 @@ impl Descriptor {
                 }
             })
             .await?;
-        Ok(Self::calculate_metadata_hash(&meta))
-    }
-
-    async fn get_descriptor_metadata(fd: &types::Descriptor) -> FsResult<cap_std::fs::Metadata> {
-        match fd {
-            Descriptor::File(f) => {
-                // No permissions check on metadata: if opened, allowed to stat it
-                Ok(f.spawn_blocking(|f| f.metadata()).await?)
-            }
-            Descriptor::Dir(d) => {
-                // No permissions check on metadata: if opened, allowed to stat it
-                Ok(d.spawn_blocking(|d| d.dir_metadata()).await?)
-            }
-        }
-    }
-
-    fn calculate_metadata_hash(meta: &cap_std::fs::Metadata) -> types::MetadataHashValue {
-        use cap_fs_ext::MetadataExt;
-        // Without incurring any deps, std provides us with a 64 bit hash
-        // function:
-        use std::hash::Hasher;
-        // Note that this means that the metadata hash (which becomes a preview1 ino) may
-        // change when a different rustc release is used to build this host implementation:
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        hasher.write_u64(meta.dev());
-        hasher.write_u64(meta.ino());
-        let lower = hasher.finish();
-        // MetadataHashValue has a pair of 64-bit members for representing a
-        // single 128-bit number. However, we only have 64 bits of entropy. To
-        // synthesize the upper 64 bits, lets xor the lower half with an arbitrary
-        // constant, in this case the 64 bit integer corresponding to the IEEE
-        // double representation of (a number as close as possible to) pi.
-        // This seems better than just repeating the same bits in the upper and
-        // lower parts outright, which could make folks wonder if the struct was
-        // mangled in the ABI, or worse yet, lead to consumers of this interface
-        // expecting them to be equal.
-        let upper = lower ^ 4614256656552045848u64;
-        types::MetadataHashValue { lower, upper }
-    }
-
-    fn descriptortype_from(ft: cap_std::fs::FileType) -> types::DescriptorType {
-        use cap_fs_ext::FileTypeExt;
-        use types::DescriptorType;
-        if ft.is_dir() {
-            DescriptorType::Directory
-        } else if ft.is_symlink() {
-            DescriptorType::SymbolicLink
-        } else if ft.is_block_device() {
-            DescriptorType::BlockDevice
-        } else if ft.is_char_device() {
-            DescriptorType::CharacterDevice
-        } else if ft.is_file() {
-            DescriptorType::RegularFile
-        } else {
-            DescriptorType::Unknown
-        }
-    }
-
-    fn systemtimespec_from(
-        t: types::NewTimestamp,
-    ) -> FsResult<Option<fs_set_times::SystemTimeSpec>> {
-        use fs_set_times::SystemTimeSpec;
-        use types::NewTimestamp;
-        match t {
-            NewTimestamp::NoChange => Ok(None),
-            NewTimestamp::Now => Ok(Some(SystemTimeSpec::SymbolicNow)),
-            NewTimestamp::Timestamp(st) => {
-                Ok(Some(SystemTimeSpec::Absolute(Self::systemtime_from(st)?)))
-            }
-        }
-    }
-
-    fn systemtime_from(t: wall_clock::Datetime) -> FsResult<std::time::SystemTime> {
-        use std::time::{Duration, SystemTime};
-        SystemTime::UNIX_EPOCH
-            .checked_add(Duration::new(t.seconds, t.nanoseconds))
-            .ok_or_else(|| ErrorCode::Overflow.into())
-    }
-
-    fn datetime_from(t: std::time::SystemTime) -> wall_clock::Datetime {
-        // FIXME make this infallible or handle errors properly
-        wall_clock::Datetime::try_from(cap_std::time::SystemTime::from_std(t)).unwrap()
-    }
-
-    fn descriptorstat_from(meta: cap_std::fs::Metadata) -> types::DescriptorStat {
-        use cap_fs_ext::MetadataExt;
-        types::DescriptorStat {
-            type_: Self::descriptortype_from(meta.file_type()),
-            link_count: meta.nlink(),
-            size: meta.len(),
-            data_access_timestamp: meta
-                .accessed()
-                .map(|t| Self::datetime_from(t.into_std()))
-                .ok(),
-            data_modification_timestamp: meta
-                .modified()
-                .map(|t| Self::datetime_from(t.into_std()))
-                .ok(),
-            status_change_timestamp: meta
-                .created()
-                .map(|t| Self::datetime_from(t.into_std()))
-                .ok(),
-        }
-    }
-
-    fn symlink_follow(path_flags: types::PathFlags) -> bool {
-        path_flags.contains(types::PathFlags::SYMLINK_FOLLOW)
-    }
-}
-
-bitflags::bitflags! {
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub struct FilePerms: usize {
-        const READ = 0b1;
-        const WRITE = 0b10;
-    }
-}
-
-bitflags::bitflags! {
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub struct OpenMode: usize {
-        const READ = 0b1;
-        const WRITE = 0b10;
-    }
-}
-
-#[derive(Clone)]
-pub struct File {
-    /// The operating system File this struct is mediating access to.
-    ///
-    /// Wrapped in an Arc because the same underlying file is used for
-    /// implementing the stream types. A copy is also needed for
-    /// [`spawn_blocking`].
-    ///
-    /// [`spawn_blocking`]: Self::spawn_blocking
-    pub file: Arc<cap_std::fs::File>,
-    /// Permissions to enforce on access to the file. These permissions are
-    /// specified by a user of the `crate::WasiCtxBuilder`, and are
-    /// enforced prior to any enforced by the underlying operating system.
-    pub perms: FilePerms,
-    /// The mode the file was opened under: bits for reading, and writing.
-    /// Required to correctly report the DescriptorFlags, because cap-std
-    /// doesn't presently provide a cross-platform equivalent of reading the
-    /// oflags back out using fcntl.
-    pub open_mode: OpenMode,
-
-    allow_blocking_current_thread: bool,
-}
-
-impl File {
-    pub fn new(
-        file: cap_std::fs::File,
-        perms: FilePerms,
-        open_mode: OpenMode,
-        allow_blocking_current_thread: bool,
-    ) -> Self {
-        Self {
-            file: Arc::new(file),
-            perms,
-            open_mode,
-            allow_blocking_current_thread,
-        }
-    }
-
-    /// Spawn a task on tokio's blocking thread for performing blocking
-    /// syscalls on the underlying [`cap_std::fs::File`].
-    pub(crate) async fn spawn_blocking<F, R>(&self, body: F) -> R
-    where
-        F: FnOnce(&cap_std::fs::File) -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        match self._spawn_blocking(body) {
-            SpawnBlocking::Done(result) => result,
-            SpawnBlocking::Spawned(task) => task.await,
-        }
-    }
-
-    /// Returns `Some` when the current thread is allowed to block in filesystem
-    /// operations, and otherwise returns `None` to indicate that
-    /// `spawn_blocking` must be used.
-    pub(crate) fn as_blocking_file(&self) -> Option<&cap_std::fs::File> {
-        if self.allow_blocking_current_thread {
-            Some(&self.file)
-        } else {
-            None
-        }
-    }
-
-    fn _spawn_blocking<F, R>(&self, body: F) -> SpawnBlocking<R>
-    where
-        F: FnOnce(&cap_std::fs::File) -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        match self.as_blocking_file() {
-            Some(file) => SpawnBlocking::Done(body(file)),
-            None => {
-                let f = self.file.clone();
-                SpawnBlocking::Spawned(spawn_blocking(move || body(&f)))
-            }
-        }
-    }
-}
-
-enum SpawnBlocking<T> {
-    Done(T),
-    Spawned(AbortOnDropJoinHandle<T>),
-}
-
-bitflags::bitflags! {
-    /// Permission bits for operating on a directory.
-    ///
-    /// Directories can be limited to being readonly. This will restrict what
-    /// can be done with them, for example preventing creation of new files.
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub struct DirPerms: usize {
-        /// This directory can be read, for example its entries can be iterated
-        /// over and files can be opened.
-        const READ = 0b1;
-
-        /// This directory can be mutated, for example by creating new files
-        /// within it.
-        const MUTATE = 0b10;
-    }
-}
-
-#[derive(Clone)]
-pub struct RealDir {
-    /// The operating system file descriptor this struct is mediating access
-    /// to.
-    ///
-    /// Wrapped in an Arc because a copy is needed for [`spawn_blocking`].
-    ///
-    /// [`spawn_blocking`]: Self::spawn_blocking
-    pub dir: Arc<cap_std::fs::Dir>,
-    /// Permissions to enforce on access to this directory. These permissions
-    /// are specified by a user of the `crate::WasiCtxBuilder`, and
-    /// are enforced prior to any enforced by the underlying operating system.
-    ///
-    /// These permissions are also enforced on any directories opened under
-    /// this directory.
-    pub perms: DirPerms,
-    /// Permissions to enforce on any files opened under this directory.
-    pub file_perms: FilePerms,
-    /// The mode the directory was opened under: bits for reading, and writing.
-    /// Required to correctly report the DescriptorFlags, because cap-std
-    /// doesn't presently provide a cross-platform equivalent of reading the
-    /// oflags back out using fcntl.
-    pub open_mode: OpenMode,
-
-    allow_blocking_current_thread: bool,
-}
-
-impl RealDir {
-    pub fn new(
-        dir: cap_std::fs::Dir,
-        perms: DirPerms,
-        file_perms: FilePerms,
-        open_mode: OpenMode,
-        allow_blocking_current_thread: bool,
-    ) -> Self {
-        RealDir {
-            dir: Arc::new(dir),
-            perms,
-            file_perms,
-            open_mode,
-            allow_blocking_current_thread,
-        }
+        Ok(FileId::from_metadata(&meta).hash())
     }
 
     /// Spawn a task on tokio's blocking thread for performing blocking
     /// syscalls on the underlying [`cap_std::fs::Dir`].
-    pub(crate) async fn spawn_blocking<F, R>(&self, body: F) -> R
+    async fn spawn_blocking<F, R>(&self, body: F) -> R
     where
         F: FnOnce(&cap_std::fs::Dir) -> R + Send + 'static,
         R: Send + 'static,
@@ -1021,6 +1153,83 @@ impl RealDir {
             let d = self.dir.clone();
             spawn_blocking(move || body(&d)).await
         }
+    }
+
+    fn symlink_follow(path_flags: types::PathFlags) -> bool {
+        path_flags.contains(types::PathFlags::SYMLINK_FOLLOW)
+    }
+}
+
+#[derive(Clone)]
+pub struct VDir {
+    /// The Arc's allocation pointer also doubles as the "identity" of this
+    /// virtual directory. Which is used to implement wasi-filesystem methods
+    /// such as `is-same-object` and `metadata-hash`.
+    entries: Arc<HashMap<String, Descriptor>>,
+}
+
+impl VDir {
+    pub fn new(entries: HashMap<String, Descriptor>) -> Self {
+        // TODO: validate the entry names are valid.
+        Self {
+            entries: Arc::new(entries),
+        }
+    }
+
+    fn sync_data(&self) -> FsResult<()> {
+        // Nothing to do
+        Ok(())
+    }
+
+    fn get_flags(&self) -> FsResult<types::DescriptorFlags> {
+        Ok(types::DescriptorFlags::READ)
+    }
+
+    fn set_times(&self, _atim: types::NewTimestamp, _mtim: types::NewTimestamp) -> FsResult<()> {
+        Err(ErrorCode::NotPermitted.into())
+    }
+
+    async fn read_directory(&self) -> FsResult<ReaddirIterator> {
+        let mut results = Vec::new();
+        for (name, descriptor) in self.entries.iter() {
+            results.push(Ok(types::DirectoryEntry {
+                type_: descriptor.get_type().await?,
+                name: name.to_string(),
+            }));
+        }
+        Ok(ReaddirIterator::new(results.into_iter()))
+    }
+
+    fn sync(&self) -> FsResult<()> {
+        // Nothing to do
+        Ok(())
+    }
+
+    fn stat(&self) -> FsResult<types::DescriptorStat> {
+        Ok(types::DescriptorStat {
+            type_: types::DescriptorType::Directory,
+            link_count: 0,
+            size: 0,
+            data_access_timestamp: None,
+            data_modification_timestamp: None,
+            status_change_timestamp: None,
+        })
+    }
+
+    fn get_id(&self) -> FileId {
+        FileId::from_ptr(Arc::as_ptr(&self.entries))
+    }
+
+    fn is_same_object(a: &VDir, b: &VDir) -> bool {
+        Arc::ptr_eq(&a.entries, &b.entries)
+    }
+
+    fn metadata_hash(&self) -> FsResult<types::MetadataHashValue> {
+        Ok(self.get_id().hash())
+    }
+
+    fn is_valid_segment(s: &str) -> bool {
+        !matches!(s, "" | "." | "..")
     }
 }
 
@@ -1236,4 +1445,120 @@ impl IntoIterator for ReaddirIterator {
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_inner().unwrap()
     }
+}
+
+/// A 128-bit number that uniquely identifies a file on the system.
+///
+/// Warning! This should be treated as sensitive information and only be
+/// exposed to the WASM guest in hashed form.
+#[derive(Hash, PartialEq, Eq)]
+struct FileId {
+    a: u64,
+    b: u64,
+}
+impl FileId {
+    fn from_metadata(meta: &cap_fs_ext::Metadata) -> Self {
+        use cap_fs_ext::MetadataExt;
+
+        Self {
+            a: meta.ino(),
+            b: meta.dev(),
+        }
+    }
+
+    fn from_ptr<T>(ptr: *const T) -> Self {
+        Self {
+            a: ptr as u64,
+            b: u64::MAX,
+        }
+    }
+
+    fn hash(&self) -> types::MetadataHashValue {
+        // Without incurring any deps, std provides us with a 64 bit hash
+        // function:
+        use std::hash::Hasher;
+        // Note that this means that the metadata hash (which becomes a preview1 ino) may
+        // change when a different rustc release is used to build this host implementation:
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write_u64(self.a);
+        hasher.write_u64(self.b);
+        let lower = hasher.finish();
+        // MetadataHashValue has a pair of 64-bit members for representing a
+        // single 128-bit number. However, we only have 64 bits of entropy. To
+        // synthesize the upper 64 bits, lets xor the lower half with an arbitrary
+        // constant, in this case the 64 bit integer corresponding to the IEEE
+        // double representation of (a number as close as possible to) pi.
+        // This seems better than just repeating the same bits in the upper and
+        // lower parts outright, which could make folks wonder if the struct was
+        // mangled in the ABI, or worse yet, lead to consumers of this interface
+        // expecting them to be equal.
+        let upper = lower ^ 4614256656552045848u64;
+        types::MetadataHashValue { lower, upper }
+    }
+}
+
+fn descriptortype_from(ft: cap_std::fs::FileType) -> types::DescriptorType {
+    use cap_fs_ext::FileTypeExt;
+    use types::DescriptorType;
+    if ft.is_dir() {
+        DescriptorType::Directory
+    } else if ft.is_symlink() {
+        DescriptorType::SymbolicLink
+    } else if ft.is_block_device() {
+        DescriptorType::BlockDevice
+    } else if ft.is_char_device() {
+        DescriptorType::CharacterDevice
+    } else if ft.is_file() {
+        DescriptorType::RegularFile
+    } else {
+        DescriptorType::Unknown
+    }
+}
+
+fn systemtimespec_from(t: types::NewTimestamp) -> FsResult<Option<fs_set_times::SystemTimeSpec>> {
+    use fs_set_times::SystemTimeSpec;
+    use types::NewTimestamp;
+    match t {
+        NewTimestamp::NoChange => Ok(None),
+        NewTimestamp::Now => Ok(Some(SystemTimeSpec::SymbolicNow)),
+        NewTimestamp::Timestamp(st) => Ok(Some(SystemTimeSpec::Absolute(systemtime_from(st)?))),
+    }
+}
+
+fn systemtime_from(t: wall_clock::Datetime) -> FsResult<std::time::SystemTime> {
+    use std::time::{Duration, SystemTime};
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::new(t.seconds, t.nanoseconds))
+        .ok_or_else(|| ErrorCode::Overflow.into())
+}
+
+fn datetime_from(t: std::time::SystemTime) -> wall_clock::Datetime {
+    // FIXME make this infallible or handle errors properly
+    wall_clock::Datetime::try_from(cap_std::time::SystemTime::from_std(t)).unwrap()
+}
+
+fn descriptorstat_from(meta: cap_std::fs::Metadata) -> types::DescriptorStat {
+    use cap_fs_ext::MetadataExt;
+    types::DescriptorStat {
+        type_: descriptortype_from(meta.file_type()),
+        link_count: meta.nlink(),
+        size: meta.len(),
+        data_access_timestamp: meta.accessed().map(|t| datetime_from(t.into_std())).ok(),
+        data_modification_timestamp: meta.modified().map(|t| datetime_from(t.into_std())).ok(),
+        status_change_timestamp: meta.created().map(|t| datetime_from(t.into_std())).ok(),
+    }
+}
+
+fn descriptor_flags_from_fdflags(flags: FdFlags) -> types::DescriptorFlags {
+    let mut out = types::DescriptorFlags::empty();
+    if flags.contains(FdFlags::DSYNC) {
+        out |= types::DescriptorFlags::REQUESTED_WRITE_SYNC;
+    }
+    if flags.contains(FdFlags::RSYNC) {
+        out |= types::DescriptorFlags::DATA_INTEGRITY_SYNC;
+    }
+    if flags.contains(FdFlags::SYNC) {
+        out |= types::DescriptorFlags::FILE_INTEGRITY_SYNC;
+    }
+    out
 }

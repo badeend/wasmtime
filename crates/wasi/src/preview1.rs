@@ -2287,10 +2287,12 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
             })?;
         let mut t = self.transact()?;
         let desc = match t.view.table().get(&fd)? {
-            crate::filesystem::Descriptor::Dir(_) => Descriptor::Directory {
-                fd,
-                preopen_path: None,
-            },
+            crate::filesystem::Descriptor::Dir(_) | crate::filesystem::Descriptor::VDir(_) => {
+                Descriptor::Directory {
+                    fd,
+                    preopen_path: None,
+                }
+            }
             crate::filesystem::Descriptor::File(_) => Descriptor::File(File {
                 fd,
                 position: Default::default(),

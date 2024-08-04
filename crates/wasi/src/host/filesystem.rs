@@ -179,15 +179,17 @@ where
         new_path: String,
     ) -> FsResult<()> {
         let table = self.table();
-        table
-            .get(&fd)?
-            .link_at(
-                old_path_flags,
-                old_path,
-                table.get(&new_descriptor)?,
-                new_path,
-            )
-            .await
+        let old_descriptor = table.get(&fd)?;
+        let new_descriptor = table.get(&new_descriptor)?;
+
+        Descriptor::link_at(
+            old_descriptor,
+            old_path_flags,
+            old_path,
+            new_descriptor,
+            new_path,
+        )
+        .await
     }
 
     async fn open_at(
@@ -244,10 +246,10 @@ where
         new_path: String,
     ) -> FsResult<()> {
         let table = self.table();
-        table
-            .get(&fd)?
-            .rename_at(old_path, table.get(&new_fd)?, new_path)
-            .await
+        let old_fd = table.get(&fd)?;
+        let new_fd = table.get(&new_fd)?;
+
+        Descriptor::rename_at(old_fd, old_path, new_fd, new_path).await
     }
 
     async fn symlink_at(
