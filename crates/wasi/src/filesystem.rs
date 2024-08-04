@@ -1,5 +1,5 @@
 use crate::bindings::clocks::wall_clock;
-use crate::bindings::filesystem::types::{self, ErrorCode};
+use crate::bindings::filesystem::types::{self, ErrorCode, PathFlags};
 use crate::bindings::io::streams::{InputStream, OutputStream};
 use crate::runtime::{spawn_blocking, AbortOnDropJoinHandle};
 use crate::{HostOutputStream, StreamError, Subscribe, TrappableError};
@@ -34,9 +34,17 @@ pub enum Descriptor {
     VDir(VDir),
 }
 
-pub(crate) enum PreopenMatch<'a> {
-    Partial { dir: &'a Dir, path: String },
-    Exact(&'a Descriptor),
+enum PreopenMatch<'a> {
+    Descriptor(&'a Descriptor),
+    Path(PathAt<'a>),
+}
+impl<'a> PreopenMatch<'a> {
+    fn path(self) -> Result<PathAt<'a>, types::ErrorCode> {
+        match self {
+            PreopenMatch::Path(path) => Ok(path),
+            PreopenMatch::Descriptor(_) => Err(ErrorCode::NotPermitted.into()),
+        }
+    }
 }
 
 impl Descriptor {
@@ -47,10 +55,15 @@ impl Descriptor {
         }
     }
 
-    fn match_preopen<'a>(&'a self, path: String) -> Result<PreopenMatch<'a>, types::ErrorCode> {
+    fn match_preopen<'a>(
+        &'a self,
+        path: &'a str,
+        flags: PathFlags,
+    ) -> Result<PreopenMatch<'a>, types::ErrorCode> {
         fn lookup_virtual<'a>(
             d: &'a VDir,
-            path: &str,
+            path: &'a str,
+            flags: PathFlags,
         ) -> Result<PreopenMatch<'a>, types::ErrorCode> {
             let (current, rest) = match path.split_once('/') {
                 Some((p, s)) => (p, Some(s)),
@@ -67,33 +80,24 @@ impl Descriptor {
             };
 
             let Some(rest) = rest else {
-                return Ok(PreopenMatch::Exact(child_descriptor));
+                return Ok(PreopenMatch::Descriptor(child_descriptor));
             };
 
             match child_descriptor {
                 Descriptor::File(_) => Err(types::ErrorCode::NoEntry), // Can't navigate into a regular file.
-                Descriptor::Dir(d) => Ok(PreopenMatch::Partial {
-                    dir: d,
-                    path: rest.to_string(),
-                }),
-                Descriptor::VDir(v) => lookup_virtual(v, rest),
+                Descriptor::Dir(dir) => Ok(PreopenMatch::Path(PathAt {
+                    dir,
+                    path: rest,
+                    flags,
+                })),
+                Descriptor::VDir(v) => lookup_virtual(v, rest, flags),
             }
         }
 
         match self {
             Descriptor::File(_) => Err(types::ErrorCode::NotDirectory),
-            Descriptor::Dir(d) => Ok(PreopenMatch::Partial { dir: d, path }),
-            Descriptor::VDir(v) => lookup_virtual(v, &path),
-        }
-    }
-
-    fn match_preopened_dir<'a>(
-        &'a self,
-        path: String,
-    ) -> Result<(&'a Dir, String), types::ErrorCode> {
-        match self.match_preopen(path)? {
-            PreopenMatch::Partial { dir, path } => Ok((dir, path)),
-            PreopenMatch::Exact(_) => Err(ErrorCode::NotPermitted.into()),
+            Descriptor::Dir(dir) => Ok(PreopenMatch::Path(PathAt { dir, path, flags })),
+            Descriptor::VDir(v) => lookup_virtual(v, &path, flags),
         }
     }
 
@@ -147,16 +151,14 @@ impl Descriptor {
 
     pub(crate) async fn set_times_at(
         &self,
-        path_flags: types::PathFlags,
+        path_flags: PathFlags,
         path: String,
         atim: types::NewTimestamp,
         mtim: types::NewTimestamp,
     ) -> FsResult<()> {
-        match self.match_preopen(path)? {
-            PreopenMatch::Exact(child) => child.set_times(atim, mtim).await,
-            PreopenMatch::Partial { dir, path } => {
-                dir.set_times_at(path_flags, path, atim, mtim).await
-            }
+        match self.match_preopen(&path, path_flags)? {
+            PreopenMatch::Descriptor(child) => child.set_times(atim, mtim).await,
+            PreopenMatch::Path(path) => path.set_times(atim, mtim).await,
         }
     }
 
@@ -177,9 +179,10 @@ impl Descriptor {
     }
 
     pub(crate) async fn create_directory_at(&self, path: String) -> FsResult<()> {
-        let (dir, path) = self.match_preopened_dir(path)?;
-
-        dir.create_directory_at(path).await
+        self.match_preopen(&path, PathFlags::empty())?
+            .path()?
+            .create_directory()
+            .await
     }
 
     pub(crate) async fn stat(&self) -> FsResult<types::DescriptorStat> {
@@ -192,55 +195,57 @@ impl Descriptor {
 
     pub(crate) async fn stat_at(
         &self,
-        path_flags: types::PathFlags,
+        path_flags: PathFlags,
         path: String,
     ) -> FsResult<types::DescriptorStat> {
-        match self.match_preopen(path)? {
-            PreopenMatch::Exact(child) => child.stat().await,
-            PreopenMatch::Partial { dir, path } => dir.stat_at(path_flags, path).await,
+        match self.match_preopen(&path, path_flags)? {
+            PreopenMatch::Descriptor(child) => child.stat().await,
+            PreopenMatch::Path(path) => path.stat().await,
         }
     }
 
     pub(crate) async fn link_at(
         old_descriptor: &Descriptor,
         // TODO delete the path flags from this function
-        old_path_flags: types::PathFlags,
+        old_path_flags: PathFlags,
         old_path: String,
         new_descriptor: &Descriptor,
         new_path: String,
     ) -> FsResult<()> {
-        let (old_dir, old_path) = old_descriptor.match_preopened_dir(old_path)?;
-        let (new_dir, new_path) = new_descriptor.match_preopened_dir(new_path)?;
+        let old_path = old_descriptor
+            .match_preopen(&old_path, old_path_flags)?
+            .path()?;
+        let new_path = new_descriptor
+            .match_preopen(&new_path, PathFlags::empty())?
+            .path()?;
 
-        Dir::link_at(old_dir, old_path_flags, old_path, new_dir, new_path).await
+        old_path.link(new_path).await
     }
 
     pub(crate) async fn open_at(
         &self,
-        path_flags: types::PathFlags,
+        path_flags: PathFlags,
         path: String,
         oflags: types::OpenFlags,
         flags: types::DescriptorFlags,
     ) -> FsResult<types::Descriptor> {
-        match self.match_preopen(path)? {
-            PreopenMatch::Exact(descriptor) => Ok(descriptor.clone()),
-            PreopenMatch::Partial { dir, path } => {
-                dir.open_at(path_flags, path, oflags, flags).await
-            }
+        match self.match_preopen(&path, path_flags)? {
+            PreopenMatch::Descriptor(descriptor) => Ok(descriptor.clone()),
+            PreopenMatch::Path(path) => path.open(oflags, flags).await,
         }
     }
 
     pub(crate) async fn readlink_at(&self, path: String) -> FsResult<String> {
-        match self.match_preopen(path)? {
-            PreopenMatch::Exact(_) => Err(ErrorCode::Invalid.into()),
-            PreopenMatch::Partial { dir, path } => dir.readlink_at(path).await,
+        match self.match_preopen(&path, PathFlags::empty())? {
+            PreopenMatch::Descriptor(_) => Err(ErrorCode::Invalid.into()),
+            PreopenMatch::Path(path) => path.readlink().await,
         }
     }
 
     pub(crate) async fn remove_directory_at(&self, path: String) -> FsResult<()> {
-        match self.match_preopen(path)? {
-            PreopenMatch::Exact(_) => Err(ErrorCode::NotPermitted.into()),
-            PreopenMatch::Partial { dir, path } => dir.remove_directory_at(path).await,
+        match self.match_preopen(&path, PathFlags::empty())? {
+            PreopenMatch::Descriptor(_) => Err(ErrorCode::NotPermitted.into()),
+            PreopenMatch::Path(path) => path.remove_directory().await,
         }
     }
 
@@ -250,28 +255,28 @@ impl Descriptor {
         new_fd: &Descriptor,
         new_path: String,
     ) -> FsResult<()> {
-        let (old_dir, old_path) = old_fd.match_preopened_dir(old_path)?;
-        let (new_dir, new_path) = new_fd.match_preopened_dir(new_path)?;
+        let old_path = old_fd
+            .match_preopen(&old_path, PathFlags::empty())?
+            .path()?;
+        let new_path = new_fd
+            .match_preopen(&new_path, PathFlags::empty())?
+            .path()?;
 
-        Dir::rename_at(old_dir, old_path, new_dir, new_path).await
+        old_path.rename(new_path).await
     }
 
     pub(crate) async fn symlink_at(&self, src_path: String, dest_path: String) -> FsResult<()> {
-        let (src_dir, src_path) = self.match_preopened_dir(src_path)?;
-        let (dest_dir, dest_path) = self.match_preopened_dir(dest_path)?;
+        let src_path = self.match_preopen(&src_path, PathFlags::empty())?.path()?;
+        let dest_path = self.match_preopen(&dest_path, PathFlags::empty())?.path()?;
 
-        // Only allow the creation of symlinks within the same physical preopen.
-        if Dir::is_same_object(src_dir, dest_dir).await? == false {
-            return Err(ErrorCode::NotPermitted.into());
-        }
-
-        src_dir.symlink_at(src_path, dest_path).await
+        src_path.symlink(dest_path).await
     }
 
     pub(crate) async fn unlink_file_at(&self, path: String) -> FsResult<()> {
-        let (dir, path) = self.match_preopened_dir(path)?;
-
-        dir.unlink_file_at(path).await
+        self.match_preopen(&path, PathFlags::empty())?
+            .path()?
+            .unlink_file()
+            .await
     }
 
     pub(crate) async fn read(
@@ -319,15 +324,12 @@ impl Descriptor {
     }
     pub(crate) async fn metadata_hash_at(
         &self,
-        path_flags: types::PathFlags,
+        path_flags: PathFlags,
         path: String,
     ) -> FsResult<types::MetadataHashValue> {
-        match self.match_preopen(path)? {
-            PreopenMatch::Exact(child) => child.metadata_hash().await,
-            PreopenMatch::Partial {
-                dir: base_dir,
-                path: child_path,
-            } => base_dir.metadata_hash_at(path_flags, child_path).await,
+        match self.match_preopen(&path, path_flags)? {
+            PreopenMatch::Descriptor(child) => child.metadata_hash().await,
+            PreopenMatch::Path(path) => path.metadata_hash().await,
         }
     }
 }
@@ -574,19 +576,6 @@ impl File {
         Ok(descriptorstat_from(meta))
     }
 
-    /// Spawn a task on tokio's blocking thread for performing blocking
-    /// syscalls on the underlying [`cap_std::fs::File`].
-    pub(crate) async fn spawn_blocking<F, R>(&self, body: F) -> R
-    where
-        F: FnOnce(&cap_std::fs::File) -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        match self._spawn_blocking(body) {
-            SpawnBlocking::Done(result) => result,
-            SpawnBlocking::Spawned(task) => task.await,
-        }
-    }
-
     async fn is_same_object(a: &File, b: &File) -> FsResult<bool> {
         // Short circuit if they're the same object in memory.
         if Arc::ptr_eq(&a.file, &b.file) {
@@ -620,6 +609,19 @@ impl File {
             Some(&self.file)
         } else {
             None
+        }
+    }
+
+    /// Spawn a task on tokio's blocking thread for performing blocking
+    /// syscalls on the underlying [`cap_std::fs::File`].
+    pub(crate) async fn spawn_blocking<F, R>(&self, body: F) -> R
+    where
+        F: FnOnce(&cap_std::fs::File) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        match self._spawn_blocking(body) {
+            SpawnBlocking::Done(result) => result,
+            SpawnBlocking::Spawned(task) => task.await,
         }
     }
 
@@ -789,36 +791,9 @@ impl Dir {
             .await
     }
 
-    async fn create_directory_at(&self, path: String) -> FsResult<()> {
-        if !self.perms.contains(DirPerms::MUTATE) {
-            return Err(ErrorCode::NotPermitted.into());
-        }
-        self.spawn_blocking(move |d| d.create_dir(&path)).await?;
-        Ok(())
-    }
-
     async fn stat(&self) -> FsResult<types::DescriptorStat> {
         // No permissions check on stat: if opened, allowed to stat it
         let meta = self.spawn_blocking(|d| d.dir_metadata()).await?;
-        Ok(descriptorstat_from(meta))
-    }
-
-    async fn stat_at(
-        &self,
-        path_flags: types::PathFlags,
-        path: String,
-    ) -> FsResult<types::DescriptorStat> {
-        if !self.perms.contains(DirPerms::READ) {
-            return Err(ErrorCode::NotPermitted.into());
-        }
-
-        let meta = if Self::symlink_follow(path_flags) {
-            self.spawn_blocking(move |d| d.metadata(&path)).await?
-        } else {
-            self.spawn_blocking(move |d| d.symlink_metadata(&path))
-                .await?
-        };
-
         Ok(descriptorstat_from(meta))
     }
 
@@ -838,33 +813,102 @@ impl Dir {
         Ok(())
     }
 
-    async fn set_times_at(
+    async fn is_same_object(a: &Dir, b: &Dir) -> FsResult<bool> {
+        // Short circuit if they're the same object in memory.
+        if Arc::ptr_eq(&a.dir, &b.dir) {
+            return Ok(true);
+        }
+
+        let id_a = a.get_id().await?;
+        let id_b = b.get_id().await?;
+
+        Ok(id_a == id_b)
+    }
+
+    async fn get_id(&self) -> FsResult<FileId> {
+        // No permissions check on metadata: if opened, allowed to stat it
+        let meta = self
+            .spawn_blocking(|d| d.dir_metadata())
+            .await
+            .map_err(|err| FsError::trap(err))?;
+        Ok(FileId::from_metadata(&meta))
+    }
+
+    async fn metadata_hash(&self) -> FsResult<types::MetadataHashValue> {
+        Ok(self.get_id().await?.hash())
+    }
+
+    /// Spawn a task on tokio's blocking thread for performing blocking
+    /// syscalls on the underlying [`cap_std::fs::Dir`].
+    async fn spawn_blocking<F, R>(&self, body: F) -> R
+    where
+        F: FnOnce(&cap_std::fs::Dir) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        if self.allow_blocking_current_thread {
+            body(&self.dir)
+        } else {
+            let d = self.dir.clone();
+            spawn_blocking(move || body(&d)).await
+        }
+    }
+}
+
+/// Represents an unvalidated(!) path, relative to a specific directory file descriptor.
+struct PathAt<'a> {
+    dir: &'a Dir,
+    path: &'a str,
+    flags: PathFlags,
+}
+impl<'a> PathAt<'a> {
+    async fn create_directory(self) -> FsResult<()> {
+        if !self.dir.perms.contains(DirPerms::MUTATE) {
+            return Err(ErrorCode::NotPermitted.into());
+        }
+        self.spawn_blocking(move |d, p| d.create_dir(p)).await?;
+        Ok(())
+    }
+
+    async fn stat(&self) -> FsResult<types::DescriptorStat> {
+        if !self.dir.perms.contains(DirPerms::READ) {
+            return Err(ErrorCode::NotPermitted.into());
+        }
+
+        let meta = if Self::symlink_follow(self.flags) {
+            self.spawn_blocking(move |d, p| d.metadata(p)).await?
+        } else {
+            self.spawn_blocking(move |d, p| d.symlink_metadata(p))
+                .await?
+        };
+
+        Ok(descriptorstat_from(meta))
+    }
+
+    async fn set_times(
         &self,
-        path_flags: types::PathFlags,
-        path: String,
         atim: types::NewTimestamp,
         mtim: types::NewTimestamp,
     ) -> FsResult<()> {
         use cap_fs_ext::DirExt;
 
-        if !self.perms.contains(DirPerms::MUTATE) {
+        if !self.dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
         let atim = systemtimespec_from(atim)?;
         let mtim = systemtimespec_from(mtim)?;
-        if Self::symlink_follow(path_flags) {
-            self.spawn_blocking(move |d| {
+        if Self::symlink_follow(self.flags) {
+            self.spawn_blocking(move |d, p| {
                 d.set_times(
-                    &path,
+                    p,
                     atim.map(cap_fs_ext::SystemTimeSpec::from_std),
                     mtim.map(cap_fs_ext::SystemTimeSpec::from_std),
                 )
             })
             .await?;
         } else {
-            self.spawn_blocking(move |d| {
+            self.spawn_blocking(move |d, p| {
                 d.set_symlink_times(
-                    &path,
+                    p,
                     atim.map(cap_fs_ext::SystemTimeSpec::from_std),
                     mtim.map(cap_fs_ext::SystemTimeSpec::from_std),
                 )
@@ -874,34 +918,28 @@ impl Dir {
         Ok(())
     }
 
-    async fn link_at(
-        old_dir: &Dir,
-        // TODO delete the path flags from this function
-        old_path_flags: types::PathFlags,
-        old_path: String,
-        new_dir: &Dir,
-        new_path: String,
-    ) -> FsResult<()> {
-        if !old_dir.perms.contains(DirPerms::MUTATE) {
+    async fn link(&self, new_path: PathAt<'_>) -> FsResult<()> {
+        if !self.dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        if !new_dir.perms.contains(DirPerms::MUTATE) {
+        if !new_path.dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        if Self::symlink_follow(old_path_flags) {
+        if Self::symlink_follow(self.flags) {
             return Err(ErrorCode::Invalid.into());
         }
-        let new_dir_handle = std::sync::Arc::clone(&new_dir.dir);
-        old_dir
-            .spawn_blocking(move |d| d.hard_link(&old_path, &new_dir_handle, &new_path))
+        if Self::symlink_follow(new_path.flags) {
+            return Err(ErrorCode::Invalid.into());
+        }
+        let new_dir_handle = std::sync::Arc::clone(&new_path.dir.dir);
+        let new_path = new_path.path.to_string();
+        self.spawn_blocking(move |d, p| d.hard_link(p, &new_dir_handle, &new_path))
             .await?;
         Ok(())
     }
 
-    async fn open_at(
+    async fn open(
         &self,
-        path_flags: types::PathFlags,
-        path: String,
         oflags: types::OpenFlags,
         flags: types::DescriptorFlags,
     ) -> FsResult<types::Descriptor> {
@@ -909,11 +947,11 @@ impl Dir {
         use system_interface::fs::{FdFlags, GetSetFdFlags};
         use types::{DescriptorFlags, OpenFlags};
 
-        if !self.perms.contains(DirPerms::READ) {
+        if !self.dir.perms.contains(DirPerms::READ) {
             Err(ErrorCode::NotPermitted)?;
         }
 
-        if !self.perms.contains(DirPerms::MUTATE) {
+        if !self.dir.perms.contains(DirPerms::MUTATE) {
             if oflags.contains(OpenFlags::CREATE) || oflags.contains(OpenFlags::TRUNCATE) {
                 Err(ErrorCode::NotPermitted)?;
             }
@@ -957,7 +995,7 @@ impl Dir {
             opts.read(true);
             open_mode |= OpenMode::READ;
         }
-        if Self::symlink_follow(path_flags) {
+        if Self::symlink_follow(self.flags) {
             opts.follow(FollowSymlinks::Yes);
         } else {
             opts.follow(FollowSymlinks::No);
@@ -982,10 +1020,10 @@ impl Dir {
 
         // Now enforce this WasiCtx's permissions before letting the OS have
         // its shot:
-        if !self.perms.contains(DirPerms::MUTATE) && create {
+        if !self.dir.perms.contains(DirPerms::MUTATE) && create {
             Err(ErrorCode::NotPermitted)?;
         }
-        if !self.file_perms.contains(FilePerms::WRITE) && open_mode.contains(OpenMode::WRITE) {
+        if !self.dir.file_perms.contains(FilePerms::WRITE) && open_mode.contains(OpenMode::WRITE) {
             Err(ErrorCode::NotPermitted)?;
         }
 
@@ -999,8 +1037,8 @@ impl Dir {
         }
 
         let opened = self
-            .spawn_blocking::<_, std::io::Result<OpenResult>>(move |d| {
-                let mut opened = d.open_with(&path, &opts)?;
+            .spawn_blocking::<_, std::io::Result<OpenResult>>(move |d, p| {
+                let mut opened = d.open_with(p, &opts)?;
                 if opened.metadata()?.is_dir() {
                     Ok(OpenResult::Dir(cap_std::fs::Dir::from_std_file(
                         opened.into_std(),
@@ -1020,120 +1058,95 @@ impl Dir {
         match opened {
             OpenResult::Dir(dir) => Ok(Descriptor::Dir(Dir::new(
                 dir,
-                self.perms,
-                self.file_perms,
+                self.dir.perms,
+                self.dir.file_perms,
                 open_mode,
-                self.allow_blocking_current_thread,
+                self.dir.allow_blocking_current_thread,
             ))),
 
             OpenResult::File(file) => Ok(Descriptor::File(File::new(
                 file,
-                self.file_perms,
+                self.dir.file_perms,
                 open_mode,
-                self.allow_blocking_current_thread,
+                self.dir.allow_blocking_current_thread,
             ))),
 
             OpenResult::NotDir => Err(ErrorCode::NotDirectory.into()),
         }
     }
 
-    async fn readlink_at(&self, path: String) -> FsResult<String> {
-        if !self.perms.contains(DirPerms::READ) {
+    async fn readlink(&self) -> FsResult<String> {
+        if !self.dir.perms.contains(DirPerms::READ) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        let link = self.spawn_blocking(move |d| d.read_link(&path)).await?;
+        let link = self.spawn_blocking(move |d, p| d.read_link(p)).await?;
         Ok(link
             .into_os_string()
             .into_string()
             .map_err(|_| ErrorCode::IllegalByteSequence)?)
     }
 
-    async fn remove_directory_at(&self, path: String) -> FsResult<()> {
-        if !self.perms.contains(DirPerms::MUTATE) {
+    async fn remove_directory(&self) -> FsResult<()> {
+        if !self.dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        Ok(self.spawn_blocking(move |d| d.remove_dir(&path)).await?)
+        Ok(self.spawn_blocking(move |d, p| d.remove_dir(p)).await?)
     }
 
-    async fn rename_at(
-        old_dir: &Dir,
-        old_path: String,
-        new_dir: &Dir,
-        new_path: String,
-    ) -> FsResult<()> {
-        if !old_dir.perms.contains(DirPerms::MUTATE) {
+    async fn rename(&self, new_path: PathAt<'_>) -> FsResult<()> {
+        if !self.dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        if !new_dir.perms.contains(DirPerms::MUTATE) {
+        if !new_path.dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
-        let new_dir_handle = std::sync::Arc::clone(&new_dir.dir);
-        Ok(old_dir
-            .spawn_blocking(move |d| d.rename(&old_path, &new_dir_handle, &new_path))
+        let new_dir_handle = std::sync::Arc::clone(&new_path.dir.dir);
+        let new_path = new_path.path.to_string();
+        Ok(self
+            .spawn_blocking(move |d, p| d.rename(p, &new_dir_handle, &new_path))
             .await?)
     }
 
-    async fn symlink_at(&self, src_path: String, dest_path: String) -> FsResult<()> {
+    async fn symlink(&self, dest: PathAt<'_>) -> FsResult<()> {
         // On windows, Dir.symlink is provided by DirExt
         #[cfg(windows)]
         use cap_fs_ext::DirExt;
 
-        if !self.perms.contains(DirPerms::MUTATE) {
+        // Only allow the creation of symlinks within the same physical preopen.
+        if Dir::is_same_object(self.dir, dest.dir).await? == false {
             return Err(ErrorCode::NotPermitted.into());
         }
+
+        if !self.dir.perms.contains(DirPerms::MUTATE) {
+            return Err(ErrorCode::NotPermitted.into());
+        }
+
+        let dest_path = dest.path.to_string();
         Ok(self
-            .spawn_blocking(move |d| d.symlink(&src_path, &dest_path))
+            .spawn_blocking(move |d, p| d.symlink(p, &dest_path))
             .await?)
     }
 
-    async fn unlink_file_at(&self, path: String) -> FsResult<()> {
+    async fn unlink_file(&self) -> FsResult<()> {
         use cap_fs_ext::DirExt;
 
-        if !self.perms.contains(DirPerms::MUTATE) {
+        if !self.dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
         Ok(self
-            .spawn_blocking(move |d| d.remove_file_or_symlink(&path))
+            .spawn_blocking(move |d, p| d.remove_file_or_symlink(p))
             .await?)
-    }
-
-    async fn is_same_object(a: &Dir, b: &Dir) -> FsResult<bool> {
-        // Short circuit if they're the same object in memory.
-        if Arc::ptr_eq(&a.dir, &b.dir) {
-            return Ok(true);
-        }
-
-        let id_a = a.get_id().await?;
-        let id_b = b.get_id().await?;
-
-        Ok(id_a == id_b)
-    }
-
-    async fn get_id(&self) -> FsResult<FileId> {
-        // No permissions check on metadata: if opened, allowed to stat it
-        let meta = self
-            .spawn_blocking(|d| d.dir_metadata())
-            .await
-            .map_err(|err| FsError::trap(err))?;
-        Ok(FileId::from_metadata(&meta))
     }
 
     async fn metadata_hash(&self) -> FsResult<types::MetadataHashValue> {
-        Ok(self.get_id().await?.hash())
-    }
-
-    pub(crate) async fn metadata_hash_at(
-        &self,
-        path_flags: types::PathFlags,
-        path: String,
-    ) -> FsResult<types::MetadataHashValue> {
         // No permissions check on metadata: if dir opened, allowed to stat it
+        let symlink_follow = Self::symlink_follow(self.flags);
         let meta = self
-            .spawn_blocking(move |d| {
-                if Self::symlink_follow(path_flags) {
-                    d.metadata(path)
+            .spawn_blocking(move |d, p| {
+                if symlink_follow {
+                    d.metadata(p)
                 } else {
-                    d.symlink_metadata(path)
+                    d.symlink_metadata(p)
                 }
             })
             .await?;
@@ -1144,19 +1157,20 @@ impl Dir {
     /// syscalls on the underlying [`cap_std::fs::Dir`].
     async fn spawn_blocking<F, R>(&self, body: F) -> R
     where
-        F: FnOnce(&cap_std::fs::Dir) -> R + Send + 'static,
+        F: FnOnce(&cap_std::fs::Dir, &str) -> R + Send + 'static,
         R: Send + 'static,
     {
-        if self.allow_blocking_current_thread {
-            body(&self.dir)
+        if self.dir.allow_blocking_current_thread {
+            body(&self.dir.dir, self.path)
         } else {
-            let d = self.dir.clone();
-            spawn_blocking(move || body(&d)).await
+            let dir = self.dir.dir.clone();
+            let path = self.path.to_string();
+            spawn_blocking(move || body(&dir, &path)).await
         }
     }
 
-    fn symlink_follow(path_flags: types::PathFlags) -> bool {
-        path_flags.contains(types::PathFlags::SYMLINK_FOLLOW)
+    fn symlink_follow(path_flags: PathFlags) -> bool {
+        path_flags.contains(PathFlags::SYMLINK_FOLLOW)
     }
 }
 
