@@ -27,6 +27,20 @@ where
         }
         Ok(results)
     }
+
+    fn root_directory(&mut self) -> anyhow::Result<Resource<types::Descriptor>> {
+        let descriptor = self.ctx().fs_root.clone();
+        Ok(self.table().push(descriptor)?)
+    }
+
+    fn initial_working_path(&mut self) -> anyhow::Result<Option<String>> {
+        let initial_working_directory = self.ctx().initial_working_directory.as_str();
+        if initial_working_directory == "/" {
+            Ok(None)
+        } else {
+            Ok(Some(initial_working_directory[1..].to_string()))
+        }
+    }
 }
 
 #[async_trait::async_trait]

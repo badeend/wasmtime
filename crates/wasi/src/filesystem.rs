@@ -34,7 +34,7 @@ pub enum Descriptor {
     VDir(VDir),
 }
 
-enum PreopenMatch<'a> {
+pub(crate) enum PreopenMatch<'a> {
     Descriptor(&'a Descriptor),
     Path(PathAt<'a>),
 }
@@ -60,44 +60,15 @@ impl Descriptor {
         path: &'a str,
         flags: PathFlags,
     ) -> Result<PreopenMatch<'a>, types::ErrorCode> {
-        fn lookup_virtual<'a>(
-            d: &'a VDir,
-            path: &'a str,
-            flags: PathFlags,
-        ) -> Result<PreopenMatch<'a>, types::ErrorCode> {
-            let (current, rest) = match path.split_once('/') {
-                Some((p, s)) => (p, Some(s)),
-                None => (path, None),
-            };
-
-            // TODO: properly implement these special segments:
-            if !VDir::is_valid_segment(current) {
-                return Err(types::ErrorCode::Unsupported);
-            }
-
-            let Some(child_descriptor) = d.entries.get(current) else {
-                return Err(types::ErrorCode::NoEntry);
-            };
-
-            let Some(rest) = rest else {
-                return Ok(PreopenMatch::Descriptor(child_descriptor));
-            };
-
-            match child_descriptor {
-                Descriptor::File(_) => Err(types::ErrorCode::NoEntry), // Can't navigate into a regular file.
-                Descriptor::Dir(dir) => Ok(PreopenMatch::Path(PathAt {
-                    dir,
-                    path: rest,
-                    flags,
-                })),
-                Descriptor::VDir(v) => lookup_virtual(v, rest, flags),
-            }
+        // TODO: proper support for "." and ".." _anywhere_ in the path. This here is only barely good enough to make the unit tests pass.
+        if path == "." {
+            return Ok(PreopenMatch::Descriptor(self));
         }
 
         match self {
             Descriptor::File(_) => Err(types::ErrorCode::NotDirectory),
             Descriptor::Dir(dir) => Ok(PreopenMatch::Path(PathAt { dir, path, flags })),
-            Descriptor::VDir(v) => lookup_virtual(v, &path, flags),
+            Descriptor::VDir(v) => v.resolve_path(path, flags),
         }
     }
 
@@ -855,7 +826,7 @@ impl Dir {
 }
 
 /// Represents an unvalidated(!) path, relative to a specific directory file descriptor.
-struct PathAt<'a> {
+pub(crate) struct PathAt<'a> {
     dir: &'a Dir,
     path: &'a str,
     flags: PathFlags,
@@ -1183,10 +1154,83 @@ pub struct VDir {
 }
 
 impl VDir {
-    pub fn new(entries: HashMap<String, Descriptor>) -> Self {
-        // TODO: validate the entry names are valid.
+    pub fn new() -> Self {
         Self {
-            entries: Arc::new(entries),
+            entries: Arc::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn mount(&mut self, path: &str, descriptor: Descriptor) -> anyhow::Result<()> {
+        use std::collections::hash_map::Entry;
+
+        let entries = Arc::get_mut(&mut self.entries).expect("vdir already shared");
+
+        let (entry_name, rest) = match path.split_once('/') {
+            Some((p, s)) => (p, Some(s)),
+            None => (path, None),
+        };
+
+        if !Self::is_valid_segment(entry_name) {
+            return Err(anyhow!("invalid preopen guest path"));
+        }
+
+        if let Some(rest) = rest {
+            let entry_descriptor = match entries.entry(entry_name.to_string()) {
+                Entry::Occupied(o) => o.into_mut(),
+                Entry::Vacant(v) => v.insert(Descriptor::VDir(VDir::new())),
+            };
+
+            match entry_descriptor {
+                Descriptor::File(_) => Err(anyhow!("conflicting preopen guest path. can not be both a file and virtual directory at the same time")),
+                Descriptor::Dir(_) => Err(anyhow!("conflicting preopen guest path. can not overlay real directory with virtual directory")),
+                Descriptor::VDir(v) => v.mount(rest, descriptor),
+            }
+        } else {
+            match entries.entry(entry_name.to_string()) {
+                Entry::Occupied(_) => Err(anyhow!("duplicate mount on same guest path")),
+                Entry::Vacant(v) => {
+                    v.insert(descriptor);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    pub(crate) fn resolve_path<'a>(
+        &'a self,
+        path: &'a str,
+        flags: PathFlags,
+    ) -> Result<PreopenMatch<'a>, types::ErrorCode> {
+        let (current, rest) = match path.split_once('/') {
+            Some((p, s)) => (p, Some(s)),
+            None => (path, None),
+        };
+
+        // TODO: properly implement these special segments:
+        if !Self::is_valid_segment(current) {
+            return Err(types::ErrorCode::Unsupported);
+        }
+
+        let Some(child_descriptor) = self.entries.get(current) else {
+            return Err(types::ErrorCode::NoEntry);
+        };
+
+        let Some(rest) = rest else {
+            return Ok(PreopenMatch::Descriptor(child_descriptor));
+        };
+
+        match child_descriptor {
+            Descriptor::File(_) => Err(types::ErrorCode::NoEntry), // Can't navigate into a regular file.
+            Descriptor::Dir(dir) => Ok(PreopenMatch::Path(PathAt {
+                dir,
+                path: rest,
+                flags,
+            })),
+            Descriptor::VDir(v) => v.resolve_path(rest, flags),
         }
     }
 

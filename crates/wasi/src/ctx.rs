@@ -3,13 +3,13 @@ use crate::{
         host::{monotonic_clock, wall_clock},
         HostMonotonicClock, HostWallClock,
     },
-    filesystem::{Dir, OpenMode},
+    filesystem::{Dir, OpenMode, VDir},
     network::{SocketAddrCheck, SocketAddrUse},
-    pipe, random, stdio,
-    stdio::{StdinStream, StdoutStream},
+    pipe, random,
+    stdio::{self, StdinStream, StdoutStream},
     DirPerms, FilePerms,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use cap_rand::{Rng, RngCore, SeedableRng};
 use cap_std::ambient_authority;
 use std::path::Path;
@@ -44,6 +44,8 @@ pub struct WasiCtxBuilder {
     stderr: Box<dyn StdoutStream>,
     env: Vec<(String, String)>,
     args: Vec<String>,
+    fs_root: crate::filesystem::Descriptor,
+    initial_working_directory: String,
     preopens: Vec<(Dir, String)>,
     socket_addr_check: SocketAddrCheck,
     random: Box<dyn RngCore + Send>,
@@ -66,6 +68,7 @@ impl WasiCtxBuilder {
     /// * no env vars
     /// * no arguments
     /// * no preopens
+    /// * the initial working directory is: `/default`
     /// * clocks use the host implementation of wall/monotonic clocks
     /// * RNGs are all initialized with random state and suitable generator
     ///   quality to satisfy the requirements of WASI APIs.
@@ -93,6 +96,8 @@ impl WasiCtxBuilder {
             stderr: Box::new(pipe::SinkOutputStream),
             env: Vec::new(),
             args: Vec::new(),
+            fs_root: crate::filesystem::Descriptor::VDir(VDir::new()),
+            initial_working_directory: "/default".to_string(),
             preopens: Vec::new(),
             socket_addr_check: SocketAddrCheck::default(),
             random: random::thread_rng(),
@@ -279,6 +284,22 @@ impl WasiCtxBuilder {
         self.args(&std::env::args().collect::<Vec<String>>())
     }
 
+    /// Configure this _before_ configuring the preopens.
+    pub fn initial_working_directory(&mut self, guest_path: impl AsRef<str>) -> Result<&mut Self> {
+        let guest_path = guest_path.as_ref();
+        if guest_path.starts_with("/") == false {
+            return Err(anyhow!(
+                "initial working directory must be an absolute path"
+            ));
+        }
+        if guest_path != "/" && guest_path.ends_with("/") {
+            return Err(anyhow!("initial working directory may not end with slash"));
+        }
+
+        self.initial_working_directory = guest_path.to_owned();
+        Ok(self)
+    }
+
     /// Configures a "preopened directory" to be available to WebAssembly.
     ///
     /// By default WebAssembly does not have access to the filesystem because
@@ -339,16 +360,57 @@ impl WasiCtxBuilder {
         if dir_perms.contains(DirPerms::MUTATE) {
             open_mode |= OpenMode::WRITE;
         }
-        self.preopens.push((
-            Dir::new(
-                dir,
-                dir_perms,
-                file_perms,
-                open_mode,
-                self.allow_blocking_current_thread,
-            ),
-            guest_path.as_ref().to_owned(),
-        ));
+        let dir = Dir::new(
+            dir,
+            dir_perms,
+            file_perms,
+            open_mode,
+            self.allow_blocking_current_thread,
+        );
+
+        // Experimental VFS:
+        {
+            let dir = crate::filesystem::Descriptor::Dir(dir.clone());
+
+            // TODO: very bad path manipulation code :)
+            let absolute_guest_path = match guest_path.as_ref() {
+                "." => self.initial_working_directory.clone(),
+                s if s.starts_with("./") => {
+                    format!("{}/{}", &self.initial_working_directory, &s[2..])
+                }
+                s => s.to_string(),
+            };
+
+            if absolute_guest_path.starts_with('/') == false {
+                return Err(anyhow!("guest path must be absolute"));
+            }
+
+            if absolute_guest_path == "/" {
+                match &self.fs_root {
+                    crate::filesystem::Descriptor::VDir(v) if v.is_empty() => {
+                        self.fs_root = dir;
+                    }
+                    _ => return Err(anyhow!("conflicting preopens at the root path")),
+                }
+            } else {
+                match &mut self.fs_root {
+                    crate::filesystem::Descriptor::File(_) => {
+                        unreachable!("root dir can't be a file")
+                    }
+                    crate::filesystem::Descriptor::Dir(_) => {
+                        return Err(anyhow!("conflicting preopens"))
+                    }
+                    crate::filesystem::Descriptor::VDir(v) => {
+                        v.mount(&absolute_guest_path[1..], dir)?;
+                    }
+                }
+            }
+        }
+
+        // Regular preopens:
+        {
+            self.preopens.push((dir, guest_path.as_ref().to_owned()));
+        }
         Ok(self)
     }
 
@@ -472,6 +534,8 @@ impl WasiCtxBuilder {
             stderr,
             env,
             args,
+            fs_root,
+            initial_working_directory,
             preopens,
             socket_addr_check,
             random,
@@ -491,6 +555,8 @@ impl WasiCtxBuilder {
             stderr,
             env,
             args,
+            fs_root, // TODO: attempt to mount `initial_working_directory` as an empty folder if it doesnt already exist
+            initial_working_directory,
             preopens,
             socket_addr_check,
             random,
@@ -647,6 +713,8 @@ pub struct WasiCtx {
     pub(crate) monotonic_clock: Box<dyn HostMonotonicClock + Send>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) args: Vec<String>,
+    pub(crate) fs_root: crate::filesystem::Descriptor,
+    pub(crate) initial_working_directory: String,
     pub(crate) preopens: Vec<(Dir, String)>,
     pub(crate) stdin: Box<dyn StdinStream>,
     pub(crate) stdout: Box<dyn StdoutStream>,

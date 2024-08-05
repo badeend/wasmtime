@@ -404,7 +404,64 @@ impl Descriptors {
                 preopen_path: Some(dir.1),
             })?;
         }
+
+        descriptors.add_root_and_cwd(&mut host)?;
+
         Ok(descriptors)
+    }
+
+    fn add_root_and_cwd(
+        &mut self,
+        host: &mut WasiImpl<&mut WasiP1Ctx>,
+    ) -> Result<(), types::Error> {
+        let root_fd = host.root_directory().map_err(types::Error::trap)?;
+
+        self.add_cwd(host, &root_fd)?;
+
+        self.push(Descriptor::Directory {
+            fd: root_fd,
+            preopen_path: Some("/".to_string()),
+        })?;
+        Ok(())
+    }
+
+    fn add_cwd(
+        &mut self,
+        host: &mut WasiImpl<&mut WasiP1Ctx>,
+        root_fd: &Resource<crate::filesystem::Descriptor>,
+    ) -> Result<(), types::Error> {
+        let Some(initial_working_path) = host.initial_working_path().map_err(types::Error::trap)?
+        else {
+            // No cwd configured.
+            return Ok(());
+        };
+
+        let table = host.table();
+
+        let crate::filesystem::Descriptor::VDir(root_vdir) = table
+            .get(&root_fd)
+            .map_err(|e| types::Error::trap(e.into()))?
+        else {
+            // This adapter is only able to open CWDs if they're mounted in VDirs, because we can't `await` in here.
+            return Ok(());
+        };
+
+        let crate::filesystem::PreopenMatch::Descriptor(d) = root_vdir
+            .resolve_path(&initial_working_path, filesystem::PathFlags::empty())
+            .map_err(|e| types::Error::trap(e.into()))?
+        else {
+            // This adapter is only able to open CWDs if they're mounted in VDirs, because we can't `await` in here.
+            return Ok(());
+        };
+
+        self.push(Descriptor::Directory {
+            fd: table
+                .push(d.clone())
+                .map_err(|e| types::Error::trap(e.into()))?,
+            preopen_path: Some(".".to_string()),
+        })?;
+
+        Ok(())
     }
 
     /// Returns next descriptor number, which was never assigned

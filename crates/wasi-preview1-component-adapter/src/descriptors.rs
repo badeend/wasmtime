@@ -3,7 +3,6 @@ use crate::bindings::wasi::io::streams::{InputStream, OutputStream};
 use crate::{BlockingMode, ImportAlloc, State, TrappingUnwrap, WasmStr};
 use core::cell::{Cell, OnceCell, UnsafeCell};
 use core::mem::MaybeUninit;
-use core::num::NonZeroUsize;
 use wasi::{Errno, Fd};
 
 #[cfg(not(feature = "proxy"))]
@@ -23,6 +22,19 @@ pub enum Descriptor {
     Streams(Streams),
 
     Bad,
+}
+
+#[cfg(not(feature = "proxy"))]
+impl Descriptor {
+    pub fn file(&self) -> Result<&File, Errno> {
+        match self {
+            Descriptor::Streams(Streams {
+                type_: StreamType::File(f),
+                ..
+            }) => Ok(f),
+            _ => Err(wasi::ERRNO_BADF),
+        }
+    }
 }
 
 /// Input and/or output wasi-streams, along with a stream type that
@@ -190,11 +202,16 @@ impl Descriptors {
 
         #[cfg(not(feature = "proxy"))]
         d.open_preopens(state);
+
+        #[cfg(not(feature = "proxy"))]
+        d.mount_root_fs(state);
         d
     }
 
     #[cfg(not(feature = "proxy"))]
     fn open_preopens(&self, state: &State) {
+        use crate::FileOrigin;
+
         unsafe {
             let alloc = ImportAlloc::CountAndDiscardStrings {
                 strings_size: 0,
@@ -210,6 +227,8 @@ impl Descriptors {
             });
             for i in 0..preopens.len {
                 let preopen = preopens.base.add(i).read();
+                let preopen_path_len = preopen.path.len;
+                assert!(preopen_path_len > 0);
                 // Expectation is that the descriptor index is initialized with
                 // stdio (0,1,2) and no others, so that preopens are 3..
                 let descriptor_type = preopen.descriptor.get_type().trapping_unwrap();
@@ -222,12 +241,61 @@ impl Descriptors {
                         position: Cell::new(0),
                         append: false,
                         blocking_mode: BlockingMode::Blocking,
-                        preopen_name_len: NonZeroUsize::new(preopen.path.len),
+                        origin: FileOrigin::PreOpen(preopen_path_len),
                     }),
                 }))
                 .trapping_unwrap();
             }
         }
+    }
+
+    #[cfg(not(feature = "proxy"))]
+    fn mount_root_fs(&self, state: &State) {
+        use crate::bindings::wasi::filesystem::preopens;
+        use crate::bindings::wasi::filesystem::types::{DescriptorFlags, OpenFlags, PathFlags};
+        use crate::FileOrigin;
+
+        let root_fd = preopens::root_directory();
+
+        if let Some(cwd_path) = state.with_one_temporary_alloc(|| preopens::initial_working_path())
+        {
+            if let Ok(cwd_fd) = root_fd.open_at(
+                PathFlags::empty(),
+                &cwd_path,
+                OpenFlags::DIRECTORY,
+                DescriptorFlags::READ,
+            ) {
+                self.push(Descriptor::Streams(Streams {
+                    input: OnceCell::new(),
+                    output: OnceCell::new(),
+                    type_: StreamType::File(File {
+                        fd: cwd_fd,
+                        descriptor_type: filesystem::DescriptorType::Directory,
+                        position: Cell::new(0),
+                        append: false,
+                        blocking_mode: BlockingMode::Blocking,
+                        origin: FileOrigin::InitialWorkingDirectory,
+                    }),
+                }))
+                .trapping_unwrap();
+            }
+
+            std::mem::forget(cwd_path);
+        }
+
+        self.push(Descriptor::Streams(Streams {
+            input: OnceCell::new(),
+            output: OnceCell::new(),
+            type_: StreamType::File(File {
+                fd: root_fd,
+                descriptor_type: filesystem::DescriptorType::Directory,
+                position: Cell::new(0),
+                append: false,
+                blocking_mode: BlockingMode::Blocking,
+                origin: FileOrigin::Root,
+            }),
+        }))
+        .trapping_unwrap();
     }
 
     #[cfg(not(feature = "proxy"))]

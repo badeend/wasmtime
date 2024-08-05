@@ -34,7 +34,7 @@ pub fn open_scratch_directory(path: &str) -> Result<wasi::Fd, String> {
             }
         }
 
-        Err(format!("failed to find scratch dir"))
+        Err(format!("failed to find scratch dir: {}", path))
     }
 }
 

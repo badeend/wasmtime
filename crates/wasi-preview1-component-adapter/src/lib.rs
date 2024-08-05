@@ -22,7 +22,6 @@ use core::cmp::min;
 use core::ffi::c_void;
 use core::hint::black_box;
 use core::mem::{self, align_of, forget, size_of, ManuallyDrop, MaybeUninit};
-use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
 use core::ptr::{self, null_mut};
 use core::slice;
@@ -1084,6 +1083,9 @@ pub unsafe extern "C" fn fd_pread(
     }
 }
 
+const ROOT: &'static str = "/";
+const CWD: &'static str = ".";
+
 /// Return a description of the given preopened file descriptor.
 #[no_mangle]
 pub unsafe extern "C" fn fd_prestat_get(fd: Fd, buf: *mut Prestat) -> Errno {
@@ -1104,27 +1106,23 @@ pub unsafe extern "C" fn fd_prestat_get(fd: Fd, buf: *mut Prestat) -> Errno {
     cfg_filesystem_available! {
         State::with(|state| {
             let ds = state.descriptors();
-            match ds.get(fd)? {
-                Descriptor::Streams(Streams {
-                    type_: StreamType::File(File {
-                        preopen_name_len: Some(len),
-                        ..
-                    }),
-                    ..
-                }) => {
-                    buf.write(Prestat {
-                        tag: 0,
-                        u: PrestatU {
-                            dir: PrestatDir {
-                                pr_name_len: len.get(),
-                            },
-                        },
-                    });
+            let len = match ds.get(fd)?.file()?.origin {
+                FileOrigin::PathOpen => return Err(ERRNO_BADF),
+                FileOrigin::PreOpen(len) => len,
+                FileOrigin::Root => ROOT.len(),
+                FileOrigin::InitialWorkingDirectory => CWD.len(),
+            };
 
-                    Ok(())
-                }
-                _ => Err(ERRNO_BADF),
-            }
+            buf.write(Prestat {
+                tag: 0,
+                u: PrestatU {
+                    dir: PrestatDir {
+                        pr_name_len: len,
+                    },
+                },
+            });
+
+            Ok(())
         })
     }
 }
@@ -1135,21 +1133,27 @@ pub unsafe extern "C" fn fd_prestat_dir_name(fd: Fd, path: *mut u8, path_max_len
     cfg_filesystem_available! {
         State::with(|state| {
             let ds = state.descriptors();
-            let preopen_len = match ds.get(fd)? {
-                Descriptor::Streams(Streams {
-                    type_: StreamType::File(File {
-                        preopen_name_len: Some(len),
-                        ..
-                    }),
-                    ..
-                }) => len.get(),
-                _ => return Err(ERRNO_BADF),
-            };
-            if preopen_len > path_max_len {
-                return Err(ERRNO_NAMETOOLONG)
+            match ds.get(fd)?.file()?.origin {
+                FileOrigin::PathOpen => return Err(ERRNO_BADF),
+                FileOrigin::PreOpen(len) => {
+                    if len > path_max_len {
+                        return Err(ERRNO_NAMETOOLONG);
+                    }
+                    ds.get_preopen_path(state, fd, path, path_max_len);
+                },
+                FileOrigin::Root => {
+                    if ROOT.len() > path_max_len {
+                        return Err(ERRNO_NAMETOOLONG);
+                    }
+                    core::ptr::copy(ROOT.as_ptr(), path, ROOT.len());
+                }
+                FileOrigin::InitialWorkingDirectory => {
+                    if CWD.len() > path_max_len {
+                        return Err(ERRNO_NAMETOOLONG);
+                    }
+                    core::ptr::copy(CWD.as_ptr(), path, CWD.len());
+                }
             }
-
-            ds.get_preopen_path(state, fd, path, path_max_len);
             Ok(())
         })
     }
@@ -1856,7 +1860,7 @@ pub unsafe extern "C" fn path_open(
                     } else {
                         BlockingMode::NonBlocking
                     },
-                    preopen_name_len: None,
+                    origin: FileOrigin::PathOpen,
                 }),
             });
 
@@ -2587,8 +2591,19 @@ pub struct File {
     /// dispatch to stream's plain read and check_write.
     blocking_mode: BlockingMode,
 
-    /// TODO
-    preopen_name_len: Option<NonZeroUsize>,
+    /// How the file came into existence.
+    origin: FileOrigin,
+}
+
+pub enum FileOrigin {
+    /// Regular fd opened using `path_open`
+    PathOpen,
+    /// This is one of the directories returned by `wasi:filesystem/preopens::get-directories()`
+    PreOpen(usize),
+    /// This is the directory returned by `wasi:filesystem/preopens::root-directory()`
+    Root,
+    /// This directory was opened through the root directory at the path returned by `wasi:filesystem/preopens::initial-working-path()`
+    InitialWorkingDirectory,
 }
 
 #[cfg(not(feature = "proxy"))]

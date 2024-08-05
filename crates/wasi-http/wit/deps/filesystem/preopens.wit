@@ -5,4 +5,7 @@ interface preopens {
 
     /// Return the set of preopened directories, and their path.
     get-directories: func() -> list<tuple<descriptor, string>>;
+
+    root-directory: func() -> descriptor;
+    initial-working-path: func() -> option<string>;
 }
