@@ -409,7 +409,7 @@ impl WasiCtxBuilder {
 
         // Regular preopens:
         {
-            self.preopens.push((dir, guest_path.as_ref().to_owned()));
+            // self.preopens.push((dir, guest_path.as_ref().to_owned()));
         }
         Ok(self)
     }
