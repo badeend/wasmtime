@@ -24,19 +24,6 @@ pub enum Descriptor {
     Bad,
 }
 
-#[cfg(not(feature = "proxy"))]
-impl Descriptor {
-    pub fn file(&self) -> Result<&File, Errno> {
-        match self {
-            Descriptor::Streams(Streams {
-                type_: StreamType::File(f),
-                ..
-            }) => Ok(f),
-            _ => Err(wasi::ERRNO_BADF),
-        }
-    }
-}
-
 /// Input and/or output wasi-streams, along with a stream type that
 /// identifies what kind of stream they are and possibly supporting
 /// type-specific operations like seeking.

@@ -1106,7 +1106,7 @@ pub unsafe extern "C" fn fd_prestat_get(fd: Fd, buf: *mut Prestat) -> Errno {
     cfg_filesystem_available! {
         State::with(|state| {
             let ds = state.descriptors();
-            let len = match ds.get(fd)?.file()?.origin {
+            let len = match ds.get_dir(fd)?.origin {
                 FileOrigin::PathOpen => return Err(ERRNO_BADF),
                 FileOrigin::PreOpen(len) => len,
                 FileOrigin::Root => ROOT.len(),
@@ -1133,7 +1133,7 @@ pub unsafe extern "C" fn fd_prestat_dir_name(fd: Fd, path: *mut u8, path_max_len
     cfg_filesystem_available! {
         State::with(|state| {
             let ds = state.descriptors();
-            match ds.get(fd)?.file()?.origin {
+            match ds.get_dir(fd)?.origin {
                 FileOrigin::PathOpen => return Err(ERRNO_BADF),
                 FileOrigin::PreOpen(len) => {
                     if len > path_max_len {
