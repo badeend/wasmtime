@@ -299,7 +299,7 @@ enum Descriptor {
         stream: Resource<streams::OutputStream>,
         isatty: IsATTY,
     },
-    /// A fd of type [`crate::filesystem::Descriptor::Dir`]
+    /// A fd of type [`crate::filesystem::Descriptor::Dir`] or [`crate::filesystem::Descriptor::VDir`]
     Directory {
         fd: Resource<filesystem::Descriptor>,
         /// The path this directory was preopened as.

@@ -1,5 +1,5 @@
 use crate::bindings::clocks::wall_clock;
-use crate::bindings::filesystem::types::{self, ErrorCode, PathFlags};
+use crate::bindings::filesystem::types::{self, DescriptorFlags, ErrorCode, PathFlags};
 use crate::bindings::io::streams::{InputStream, OutputStream};
 use crate::runtime::{spawn_blocking, AbortOnDropJoinHandle};
 use crate::{HostOutputStream, StreamError, Subscribe, TrappableError};
@@ -193,6 +193,15 @@ impl Descriptor {
         old_path.link(new_path).await
     }
 
+    /// Duplicate the descriptor with equal or fewer capabilities.
+    fn dup(&self, oflags: types::OpenFlags, flags: types::DescriptorFlags) -> FsResult<Descriptor> {
+        match self {
+            Descriptor::File(f) => Ok(Descriptor::File(f.dup(oflags, flags)?)),
+            Descriptor::Dir(d) => Ok(Descriptor::Dir(d.dup(oflags, flags)?)),
+            Descriptor::VDir(v) => Ok(Descriptor::VDir(v.dup(oflags, flags)?)),
+        }
+    }
+
     pub(crate) async fn open_at(
         &self,
         path_flags: PathFlags,
@@ -201,7 +210,7 @@ impl Descriptor {
         flags: types::DescriptorFlags,
     ) -> FsResult<types::Descriptor> {
         match self.match_preopen(&path, path_flags)? {
-            PreopenMatch::Descriptor(descriptor) => Ok(descriptor.clone()),
+            PreopenMatch::Descriptor(descriptor) => Ok(descriptor.dup(oflags, flags)?),
             PreopenMatch::Path(path) => path.open(oflags, flags).await,
         }
     }
@@ -357,6 +366,57 @@ impl File {
             open_mode,
             allow_blocking_current_thread,
         }
+    }
+
+    fn dup(&self, oflags: types::OpenFlags, flags: types::DescriptorFlags) -> FsResult<File> {
+        if oflags.contains(types::OpenFlags::DIRECTORY) {
+            return Err(ErrorCode::NotDirectory.into());
+        }
+        if oflags.contains(types::OpenFlags::TRUNCATE) {
+            return Err(ErrorCode::Unsupported.into());
+        }
+        if oflags.contains(types::OpenFlags::CREATE) {
+            if oflags.contains(types::OpenFlags::EXCLUSIVE) {
+                return Err(ErrorCode::Exist.into());
+            }
+        } else {
+            if oflags.contains(types::OpenFlags::EXCLUSIVE) {
+                return Err(ErrorCode::Unsupported.into());
+            }
+        }
+
+        if flags.contains(types::DescriptorFlags::FILE_INTEGRITY_SYNC)
+            || flags.contains(types::DescriptorFlags::DATA_INTEGRITY_SYNC)
+            || flags.contains(types::DescriptorFlags::REQUESTED_WRITE_SYNC)
+        {
+            Err(ErrorCode::Unsupported)?;
+        }
+
+        let mut perms = FilePerms::empty();
+        let mut open_mode = OpenMode::empty();
+
+        if flags.contains(types::DescriptorFlags::READ) {
+            if !self.perms.contains(FilePerms::READ) {
+                return Err(ErrorCode::NotPermitted.into());
+            }
+            perms |= FilePerms::READ;
+            open_mode |= OpenMode::READ;
+        }
+
+        if flags.contains(types::DescriptorFlags::WRITE) {
+            if !self.perms.contains(FilePerms::WRITE) {
+                return Err(ErrorCode::NotPermitted.into());
+            }
+            perms |= FilePerms::WRITE;
+            open_mode |= OpenMode::WRITE;
+        }
+
+        Ok(Self {
+            file: self.file.clone(),
+            perms,
+            open_mode,
+            allow_blocking_current_thread: self.allow_blocking_current_thread,
+        })
     }
 
     async fn advise(
@@ -677,6 +737,56 @@ impl Dir {
         }
     }
 
+    fn validate_open_flags(
+        oflags: types::OpenFlags,
+        flags: types::DescriptorFlags,
+    ) -> FsResult<()> {
+        if oflags.contains(types::OpenFlags::CREATE) {
+            if oflags.contains(types::OpenFlags::EXCLUSIVE) {
+                return Err(ErrorCode::Exist.into());
+            }
+        } else {
+            if oflags.contains(types::OpenFlags::EXCLUSIVE) {
+                return Err(ErrorCode::Unsupported.into());
+            }
+        }
+
+        if oflags.contains(types::OpenFlags::TRUNCATE) {
+            return Err(ErrorCode::IsDirectory.into());
+        }
+
+        if flags.contains(types::DescriptorFlags::FILE_INTEGRITY_SYNC)
+            || flags.contains(types::DescriptorFlags::DATA_INTEGRITY_SYNC)
+            || flags.contains(types::DescriptorFlags::REQUESTED_WRITE_SYNC)
+        {
+            Err(ErrorCode::Unsupported)?;
+        }
+
+        if flags.contains(DescriptorFlags::WRITE) {
+            return Err(ErrorCode::IsDirectory.into());
+        }
+
+        Ok(())
+    }
+
+    fn dup(&self, oflags: types::OpenFlags, flags: types::DescriptorFlags) -> FsResult<Dir> {
+        Self::validate_open_flags(oflags, flags)?;
+
+        let open_mode = if flags.contains(DescriptorFlags::READ) {
+            OpenMode::READ
+        } else {
+            OpenMode::empty()
+        };
+
+        Ok(Self {
+            dir: self.dir.clone(),
+            perms: self.perms,
+            file_perms: self.file_perms,
+            open_mode: open_mode,
+            allow_blocking_current_thread: self.allow_blocking_current_thread,
+        })
+    }
+
     async fn sync_data(&self) -> FsResult<()> {
         self.spawn_blocking(|d| Ok(d.open(std::path::Component::CurDir)?.sync_data()?))
             .await
@@ -832,7 +942,7 @@ pub(crate) struct PathAt<'a> {
     flags: PathFlags,
 }
 impl<'a> PathAt<'a> {
-    async fn create_directory(self) -> FsResult<()> {
+    async fn create_directory(&self) -> FsResult<()> {
         if !self.dir.perms.contains(DirPerms::MUTATE) {
             return Err(ErrorCode::NotPermitted.into());
         }
@@ -1158,6 +1268,14 @@ impl VDir {
         Self {
             entries: Arc::new(HashMap::new()),
         }
+    }
+
+    fn dup(&self, oflags: types::OpenFlags, flags: types::DescriptorFlags) -> FsResult<VDir> {
+        Dir::validate_open_flags(oflags, flags)?;
+
+        Ok(Self {
+            entries: self.entries.clone(),
+        })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
