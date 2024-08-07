@@ -279,9 +279,7 @@ pub mod sync {
         T: WasiView,
     {
         fn drop(&mut self, stream: Resource<OutputStream>) -> anyhow::Result<()> {
-            in_tokio(async {
-                AsyncHostOutputStream::drop(self, stream).await
-            })
+            in_tokio(async { AsyncHostOutputStream::drop(self, stream).await })
         }
 
         fn check_write(&mut self, stream: Resource<OutputStream>) -> StreamResult<u64> {

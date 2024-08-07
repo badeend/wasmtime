@@ -378,6 +378,7 @@ mod async_io {
                 "[method]output-stream.blocking-write",
                 "[method]output-stream.blocking-write-and-flush",
                 "[method]output-stream.blocking-write-zeroes-and-flush",
+                "[drop]output-stream",
                 "[method]directory-entry-stream.read-directory-entry",
                 "poll",
                 "[method]pollable.block",

@@ -621,19 +621,16 @@ impl<T> LinkerInstance<'_, T> {
         Ok(())
     }
 
-    /// TODO
-    pub fn resource_async<F>(
-        &mut self,
-        name: &str,
-        ty: ResourceType,
-        dtor: F,
-    ) -> Result<()> 
-    where F: for<'a> Fn(
-            StoreContextMut<'a, T>, u32
-        ) -> Box<dyn Future<Output = Result<()>> + Send + 'a>
-        + Send
-        + Sync
-        + 'static,
+    /// Identical to [`Self::resource`], except that it takes an async destructor.
+    pub fn resource_async<F>(&mut self, name: &str, ty: ResourceType, dtor: F) -> Result<()>
+    where
+        F: for<'a> Fn(
+                StoreContextMut<'a, T>,
+                u32,
+            ) -> Box<dyn Future<Output = Result<()>> + Send + 'a>
+            + Send
+            + Sync
+            + 'static,
     {
         assert!(
             self.engine.config().async_support,
@@ -642,12 +639,7 @@ impl<T> LinkerInstance<'_, T> {
         let dtor = Arc::new(crate::func::HostFunc::wrap_inner(
             &self.engine,
             move |mut cx: crate::Caller<'_, T>, (param,): (u32,)| {
-                let async_cx = cx
-                    .store
-                    .as_context_mut()
-                    .0
-                    .async_cx()
-                    .expect("Attempt to spawn new action on dying fiber");
+                let async_cx = cx.as_context_mut().0.async_cx().expect("async cx");
                 let mut future = Pin::from(dtor(cx.as_context_mut(), param));
                 match unsafe { async_cx.block_on(future.as_mut()) } {
                     Ok(Ok(())) => Ok(()),

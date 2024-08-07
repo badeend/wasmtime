@@ -1371,7 +1371,8 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                     .context("failed to call `drop` on `input-stream`")
             }
             Descriptor::Stdout { stream, .. } | Descriptor::Stderr { stream, .. } => {
-                streams::HostOutputStream::drop(&mut self.as_wasi_impl(), stream).await
+                streams::HostOutputStream::drop(&mut self.as_wasi_impl(), stream)
+                    .await
                     .context("failed to call `drop` on `output-stream`")
             }
             Descriptor::File(File { fd, .. }) | Descriptor::Directory { fd, .. } => {
