@@ -7,5 +7,4 @@ interface preopens {
     get-directories: func() -> list<tuple<descriptor, string>>;
 
     root-directory: func() -> descriptor;
-    initial-working-path: func() -> option<string>;
 }

@@ -12,7 +12,12 @@ where
         Ok(self.ctx().args.clone())
     }
     fn initial_cwd(&mut self) -> anyhow::Result<Option<String>> {
-        // FIXME: expose cwd in builder and save in ctx
-        Ok(None)
+        let initial_cwd = self.ctx().initial_cwd.as_str();
+        if initial_cwd == "/" {
+            Ok(None)
+        } else {
+            // TODO: path may start with multiple slashes.
+            Ok(Some(initial_cwd[1..].to_string()))
+        }
     }
 }

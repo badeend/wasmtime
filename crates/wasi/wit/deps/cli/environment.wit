@@ -14,5 +14,16 @@ interface environment {
 
   /// Return a path that programs should use as their initial current working
   /// directory, interpreting `.` as shorthand for this.
+  ///
+  /// This always yields the same result over the lifetime of the component instance.
+  ///
+  /// TODO:
+  /// - This is relative to the `wasi:filesystem/preopens/root-directory`.
+  /// - This is optional.
+  /// - Never returns an empty string.
+  /// - does NOT start with a slash.
+  /// - This path can be passed straight into: `root-directory().open-at(initial-cwd)`
+  ///      though the path is not guaranteed to exist
+  /// - wasi-libc should initialize its CWD as: `"/" + (initial-cwd)`
   initial-cwd: func() -> option<string>;
 }

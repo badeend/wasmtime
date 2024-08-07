@@ -9,16 +9,4 @@ interface preopens {
     /// Get the root directory of the file system.
     /// In POSIX filesystems this is located at: `/`
     root-directory: func() -> descriptor;
-
-    /// TODO:
-    /// - The "CWD" at component instantiation time.
-    /// - This always yields the same result over the lifetime of the component instance.
-    /// - This is relative to the `root-directory`.
-    /// - This is optional.
-    /// - Never returns an empty string.
-    /// - does NOT start with a slash.
-    /// - This path can be passed straight into: `root-directory().open-at(initial-working-path)`
-    ///      though the path is not guaranteed to exist
-    /// - wasi-libc should initialize its CWD as: `"/" + (initial_working_path)`
-    initial-working-path: func() -> option<string>;
 }

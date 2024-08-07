@@ -1110,7 +1110,7 @@ pub unsafe extern "C" fn fd_prestat_get(fd: Fd, buf: *mut Prestat) -> Errno {
                 FileOrigin::PathOpen => return Err(ERRNO_BADF),
                 FileOrigin::PreOpen(len) => len,
                 FileOrigin::Root => ROOT.len(),
-                FileOrigin::InitialWorkingDirectory => CWD.len(),
+                FileOrigin::Cwd => CWD.len(),
             };
 
             buf.write(Prestat {
@@ -1147,7 +1147,7 @@ pub unsafe extern "C" fn fd_prestat_dir_name(fd: Fd, path: *mut u8, path_max_len
                     }
                     core::ptr::copy(ROOT.as_ptr(), path, ROOT.len());
                 }
-                FileOrigin::InitialWorkingDirectory => {
+                FileOrigin::Cwd => {
                     if CWD.len() > path_max_len {
                         return Err(ERRNO_NAMETOOLONG);
                     }
@@ -2602,8 +2602,8 @@ pub enum FileOrigin {
     PreOpen(usize),
     /// This is the directory returned by `wasi:filesystem/preopens::root-directory()`
     Root,
-    /// This directory was opened through the root directory at the path returned by `wasi:filesystem/preopens::initial-working-path()`
-    InitialWorkingDirectory,
+    /// This directory was opened through the root directory at the path returned by `wasi:cli/environment::initial-cwd()`
+    Cwd,
 }
 
 #[cfg(not(feature = "proxy"))]

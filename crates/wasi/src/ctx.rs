@@ -45,7 +45,7 @@ pub struct WasiCtxBuilder {
     env: Vec<(String, String)>,
     args: Vec<String>,
     fs_root: crate::filesystem::Descriptor,
-    initial_working_directory: String,
+    initial_cwd: String,
     preopens: Vec<(Dir, String)>,
     socket_addr_check: SocketAddrCheck,
     random: Box<dyn RngCore + Send>,
@@ -97,7 +97,7 @@ impl WasiCtxBuilder {
             env: Vec::new(),
             args: Vec::new(),
             fs_root: crate::filesystem::Descriptor::VDir(VDir::new()),
-            initial_working_directory: "/default".to_string(),
+            initial_cwd: "/default".to_string(),
             preopens: Vec::new(),
             socket_addr_check: SocketAddrCheck::default(),
             random: random::thread_rng(),
@@ -284,9 +284,12 @@ impl WasiCtxBuilder {
         self.args(&std::env::args().collect::<Vec<String>>())
     }
 
+    /// TODO: documentation
+    ///
     /// Configure this _before_ configuring the preopens.
-    pub fn initial_working_directory(&mut self, guest_path: impl AsRef<str>) -> Result<&mut Self> {
+    pub fn initial_cwd(&mut self, guest_path: impl AsRef<str>) -> Result<&mut Self> {
         let guest_path = guest_path.as_ref();
+        // TODO: fix ad-hoc path validation
         if guest_path.starts_with("/") == false {
             return Err(anyhow!(
                 "initial working directory must be an absolute path"
@@ -296,7 +299,7 @@ impl WasiCtxBuilder {
             return Err(anyhow!("initial working directory may not end with slash"));
         }
 
-        self.initial_working_directory = guest_path.to_owned();
+        self.initial_cwd = guest_path.to_owned();
         Ok(self)
     }
 
@@ -374,9 +377,9 @@ impl WasiCtxBuilder {
 
             // TODO: very bad path manipulation code :)
             let absolute_guest_path = match guest_path.as_ref() {
-                "." => self.initial_working_directory.clone(),
+                "." => self.initial_cwd.clone(),
                 s if s.starts_with("./") => {
-                    format!("{}/{}", &self.initial_working_directory, &s[2..])
+                    format!("{}/{}", &self.initial_cwd, &s[2..])
                 }
                 s => s.to_string(),
             };
@@ -535,7 +538,7 @@ impl WasiCtxBuilder {
             env,
             args,
             fs_root,
-            initial_working_directory,
+            initial_cwd,
             preopens,
             socket_addr_check,
             random,
@@ -555,8 +558,8 @@ impl WasiCtxBuilder {
             stderr,
             env,
             args,
-            fs_root, // TODO: attempt to mount `initial_working_directory` as an empty folder if it doesnt already exist
-            initial_working_directory,
+            fs_root,
+            initial_cwd,
             preopens,
             socket_addr_check,
             random,
@@ -714,7 +717,7 @@ pub struct WasiCtx {
     pub(crate) env: Vec<(String, String)>,
     pub(crate) args: Vec<String>,
     pub(crate) fs_root: crate::filesystem::Descriptor,
-    pub(crate) initial_working_directory: String,
+    pub(crate) initial_cwd: String,
     pub(crate) preopens: Vec<(Dir, String)>,
     pub(crate) stdin: Box<dyn StdinStream>,
     pub(crate) stdout: Box<dyn StdoutStream>,

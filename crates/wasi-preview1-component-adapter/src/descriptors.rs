@@ -251,14 +251,14 @@ impl Descriptors {
 
     #[cfg(not(feature = "proxy"))]
     fn mount_root_fs(&self, state: &State) {
+        use crate::bindings::wasi::cli;
         use crate::bindings::wasi::filesystem::preopens;
         use crate::bindings::wasi::filesystem::types::{DescriptorFlags, OpenFlags, PathFlags};
         use crate::FileOrigin;
 
         let root_fd = preopens::root_directory();
 
-        if let Some(cwd_path) = state.with_one_temporary_alloc(|| preopens::initial_working_path())
-        {
+        if let Some(cwd_path) = state.with_one_temporary_alloc(|| cli::environment::initial_cwd()) {
             if let Ok(cwd_fd) = root_fd.open_at(
                 PathFlags::empty(),
                 &cwd_path,
@@ -274,7 +274,7 @@ impl Descriptors {
                         position: Cell::new(0),
                         append: false,
                         blocking_mode: BlockingMode::Blocking,
-                        origin: FileOrigin::InitialWorkingDirectory,
+                        origin: FileOrigin::Cwd,
                     }),
                 }))
                 .trapping_unwrap();

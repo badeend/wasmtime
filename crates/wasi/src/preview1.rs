@@ -430,8 +430,7 @@ impl Descriptors {
         host: &mut WasiImpl<&mut WasiP1Ctx>,
         root_fd: &Resource<crate::filesystem::Descriptor>,
     ) -> Result<(), types::Error> {
-        let Some(initial_working_path) = host.initial_working_path().map_err(types::Error::trap)?
-        else {
+        let Some(cwd_path) = host.initial_cwd().map_err(types::Error::trap)? else {
             // No cwd configured.
             return Ok(());
         };
@@ -447,7 +446,7 @@ impl Descriptors {
         };
 
         let crate::filesystem::PreopenMatch::Descriptor(d) = root_vdir
-            .resolve_path(&initial_working_path, filesystem::PathFlags::empty())
+            .resolve_path(&cwd_path, filesystem::PathFlags::empty())
             .map_err(|e| types::Error::trap(e.into()))?
         else {
             // This adapter is only able to open CWDs if they're mounted in VDirs, because we can't `await` in here.
