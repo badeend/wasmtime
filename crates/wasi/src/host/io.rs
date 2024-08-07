@@ -42,8 +42,8 @@ impl<T> streams::HostOutputStream for WasiImpl<T>
 where
     T: WasiView,
 {
-    fn drop(&mut self, stream: Resource<OutputStream>) -> anyhow::Result<()> {
-        self.table().get(&stream)?.cancel().await; // TODO: Want to await here.
+    async fn drop(&mut self, stream: Resource<OutputStream>) -> anyhow::Result<()> {
+        self.table().get_mut(&stream)?.cancel().await;
         self.table().delete(stream)?;
         Ok(())
     }
@@ -279,7 +279,9 @@ pub mod sync {
         T: WasiView,
     {
         fn drop(&mut self, stream: Resource<OutputStream>) -> anyhow::Result<()> {
-            AsyncHostOutputStream::drop(self, stream)
+            in_tokio(async {
+                AsyncHostOutputStream::drop(self, stream).await
+            })
         }
 
         fn check_write(&mut self, stream: Resource<OutputStream>) -> StreamResult<u64> {

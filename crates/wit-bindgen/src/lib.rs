@@ -1319,17 +1319,33 @@ impl Wasmtime {
             );
             for name in get_world_resources(resolve, world) {
                 let camel = name.to_upper_camel_case();
-                uwriteln!(
-                    self.src,
-                    "
-                        linker.resource(
-                            \"{name}\",
-                            {wt}::component::ResourceType::host::<{camel}>(),
-                            move |mut store, rep| -> {wt}::Result<()> {{
-                                Host{camel}::drop(&mut host_getter(store.data_mut()), {wt}::component::Resource::new_own(rep))
-                            }},
-                        )?;"
-                );
+                if self.opts.async_.maybe_async() && camel == "OutputStream" {
+                    uwriteln!(
+                        self.src,
+                        "
+                            linker.resource_async(
+                                \"{name}\",
+                                {wt}::component::ResourceType::host::<{camel}>(),
+                                move |mut store, rep| {{
+                                    std::boxed::Box::new(async move {{
+                                        Host{camel}::drop(&mut host_getter(store.data_mut()), {wt}::component::Resource::new_own(rep)).await
+                                    }})
+                                }},
+                            )?;"
+                    );
+                } else {
+                    uwriteln!(
+                        self.src,
+                        "
+                            linker.resource(
+                                \"{name}\",
+                                {wt}::component::ResourceType::host::<{camel}>(),
+                                move |mut store, rep| -> {wt}::Result<()> {{
+                                    Host{camel}::drop(&mut host_getter(store.data_mut()), {wt}::component::Resource::new_own(rep))
+                                }},
+                            )?;"
+                    );
+                }
             }
             for f in self.import_functions.iter() {
                 self.src.push_str(&f.add_to_linker);
@@ -1490,10 +1506,17 @@ impl<'a> InterfaceGenerator<'a> {
                 self.push_str(";\n");
             }
 
-            uwrite!(
-                self.src,
-                "fn drop(&mut self, rep: {wt}::component::Resource<{camel}>) -> {wt}::Result<()>;"
-            );
+            if self.gen.opts.async_.maybe_async() && camel == "OutputStream" {
+                uwrite!(
+                    self.src,
+                    "async fn drop(&mut self, rep: {wt}::component::Resource<{camel}>) -> {wt}::Result<()>;"
+                );
+            } else {
+                uwrite!(
+                    self.src,
+                    "fn drop(&mut self, rep: {wt}::component::Resource<{camel}>) -> {wt}::Result<()>;"
+                );
+            }
 
             uwriteln!(self.src, "}}");
 
@@ -1527,11 +1550,19 @@ impl<'a> InterfaceGenerator<'a> {
                     }
                     uwriteln!(self.src, "}}");
                 }
-                uwriteln!(self.src, "
-                    fn drop(&mut self, rep: {wt}::component::Resource<{camel}>) -> {wt}::Result<()> {{
-                        Host{camel}::drop(*self, rep)
-                    }}",
-                );
+                if self.gen.opts.async_.maybe_async() && camel == "OutputStream" {
+                    uwriteln!(self.src, "
+                        async fn drop(&mut self, rep: {wt}::component::Resource<{camel}>) -> {wt}::Result<()> {{
+                            Host{camel}::drop(*self, rep).await
+                        }}",
+                    );
+                } else {
+                    uwriteln!(self.src, "
+                        fn drop(&mut self, rep: {wt}::component::Resource<{camel}>) -> {wt}::Result<()> {{
+                            Host{camel}::drop(*self, rep)
+                        }}",
+                    );
+                }
                 uwriteln!(self.src, "}}");
             }
         } else {
@@ -2226,16 +2257,31 @@ impl<'a> InterfaceGenerator<'a> {
 
         for name in get_resources(self.resolve, id) {
             let camel = name.to_upper_camel_case();
-            uwriteln!(
-                self.src,
-                "inst.resource(
-                    \"{name}\",
-                    {wt}::component::ResourceType::host::<{camel}>(),
-                    move |mut store, rep| -> {wt}::Result<()> {{
-                        Host{camel}::drop(&mut host_getter(store.data_mut()), {wt}::component::Resource::new_own(rep))
-                    }},
-                )?;"
-            )
+            if self.gen.opts.async_.maybe_async() && camel == "OutputStream" {
+                uwriteln!(
+                    self.src,
+                    "inst.resource_async(
+                        \"{name}\",
+                        {wt}::component::ResourceType::host::<{camel}>(),
+                        move |mut store, rep| {{
+                            std::boxed::Box::new(async move {{
+                                Host{camel}::drop(&mut host_getter(store.data_mut()), {wt}::component::Resource::new_own(rep)).await
+                            }})
+                        }},
+                    )?;"
+                )
+            } else {
+                uwriteln!(
+                    self.src,
+                    "inst.resource(
+                        \"{name}\",
+                        {wt}::component::ResourceType::host::<{camel}>(),
+                        move |mut store, rep| -> {wt}::Result<()> {{
+                            Host{camel}::drop(&mut host_getter(store.data_mut()), {wt}::component::Resource::new_own(rep))
+                        }},
+                    )?;"
+                )
+            }
         }
 
         for (_, func) in iface.functions.iter() {
