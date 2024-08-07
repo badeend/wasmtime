@@ -43,6 +43,7 @@ where
     T: WasiView,
 {
     fn drop(&mut self, stream: Resource<OutputStream>) -> anyhow::Result<()> {
+        self.table().get(&stream)?.cancel().await; // TODO: Want to await here.
         self.table().delete(stream)?;
         Ok(())
     }

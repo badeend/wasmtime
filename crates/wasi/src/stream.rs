@@ -153,6 +153,11 @@ pub trait HostOutputStream: Subscribe {
         self.ready().await;
         self.check_write()
     }
+
+    /// Cancel and wait on any asynchronous work to wrap up.
+    async fn cancel(&mut self) {
+        // Do nothing by default
+    }
 }
 
 #[async_trait::async_trait]

@@ -321,6 +321,7 @@ impl FileOutputStream {
 // FIXME: configurable? determine from how much space left in file?
 const FILE_WRITE_CAPACITY: usize = 1024 * 1024;
 
+#[async_trait::async_trait]
 impl HostOutputStream for FileOutputStream {
     fn write(&mut self, buf: Bytes) -> Result<(), StreamError> {
         use system_interface::fs::FileIoExt;
@@ -402,6 +403,12 @@ impl HostOutputStream for FileOutputStream {
                 _ => unreachable!(),
             },
             OutputState::Waiting(_) => Ok(0),
+        }
+    }
+    async fn cancel(&mut self) {
+        match mem::replace(&mut self.state, OutputState::Closed) {
+            OutputState::Waiting(task) => _ = task.await,
+            _ => {}
         }
     }
 }
