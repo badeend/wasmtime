@@ -7,9 +7,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use wasmtime::component::{Resource, ResourceTable};
 
-pub type PollableFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-pub type MakeFuture = for<'a> fn(&'a mut dyn Any) -> PollableFuture<'a>;
-pub type ClosureFuture = Box<dyn Fn() -> PollableFuture<'static> + Send + 'static>;
+type BoxFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+type MakeFuture = for<'a> fn(&'a mut dyn Any) -> BoxFuture<'a>;
 
 /// A host representation of the `wasi:io/poll.pollable` resource.
 ///
@@ -92,7 +91,7 @@ pub fn subscribe<T>(table: &mut ResourceTable, resource: Resource<T>) -> Result<
 where
     T: Subscribe,
 {
-    fn make_future<'a, T>(stream: &'a mut dyn Any) -> PollableFuture<'a>
+    fn make_future<'a, T>(stream: &'a mut dyn Any) -> BoxFuture<'a>
     where
         T: Subscribe,
     {
@@ -114,6 +113,77 @@ where
     };
 
     Ok(table.push_child(pollable, &resource)?)
+}
+
+/// Utility type to facilitate implementing "WASI-style" futures, where
+/// awaiting readiness and taking out the resolved value are performed in
+/// two distinct steps.
+#[derive(Debug)]
+pub enum PollableFuture<F: Future> {
+    Pending(F),
+    Ready(F::Output),
+    Consumed,
+}
+impl<F: Future> PollableFuture<F> {
+    /// Take the current state out and leave [`PollableFuture::Consumed`] in its place.
+    pub fn take(&mut self) -> Self {
+        std::mem::replace(self, Self::Consumed)
+    }
+
+    /// Return the ready value out.
+    ///
+    /// # Panics
+    /// Panics if the future isn't ready yet or has already been consumed.
+    pub fn unwrap_ready(self) -> F::Output {
+        match self {
+            Self::Ready(value) => value,
+            Self::Pending(_) => panic!("future still pending"),
+            Self::Consumed => panic!("future already consumed"),
+        }
+    }
+}
+impl<F> PollableFuture<F>
+where
+    F: Future + Unpin,
+    F::Output: Unpin,
+{
+    /// Poll the future exactly once if it is still pending.
+    pub fn poll_noop(&mut self) -> Poll<()> {
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        std::pin::pin!(self).poll(&mut cx)
+    }
+}
+#[async_trait::async_trait]
+impl<F> Subscribe for PollableFuture<F>
+where
+    F: Future + Send + Unpin + 'static,
+    F::Output: Send + Unpin,
+{
+    async fn ready(&mut self) {
+        self.await
+    }
+}
+impl<F> Future for PollableFuture<F>
+where
+    F: Future + Unpin,
+    F::Output: Unpin,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        let _self = self.get_mut();
+
+        match _self {
+            Self::Pending(fut) => match std::pin::pin!(fut).poll(cx) {
+                Poll::Ready(value) => {
+                    *_self = Self::Ready(value);
+                    Poll::Ready(())
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            Self::Ready(_) | Self::Consumed => Poll::Ready(()),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -142,14 +212,14 @@ where
             list.push(ix);
         }
 
-        let mut futures: Vec<(PollableFuture<'_>, Vec<ReadylistIndex>)> = Vec::new();
+        let mut futures: Vec<(BoxFuture<'_>, Vec<ReadylistIndex>)> = Vec::new();
         for (entry, (make_future, readylist_indices)) in table.iter_entries(table_futures) {
             let entry = entry?;
             futures.push((make_future(entry), readylist_indices));
         }
 
         struct PollList<'a> {
-            futures: Vec<(PollableFuture<'a>, Vec<ReadylistIndex>)>,
+            futures: Vec<(BoxFuture<'a>, Vec<ReadylistIndex>)>,
         }
         impl<'a> Future for PollList<'a> {
             type Output = Vec<u32>;

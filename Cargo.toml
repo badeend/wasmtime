@@ -343,6 +343,9 @@ criterion = { version = "0.5.0", default-features = false, features = ["html_rep
 rustc-hash = "2.0.0"
 libtest-mimic = "0.7.0"
 semver = { version = "1.0.17", default-features = false }
+tokio-rustls = "0.25.0"
+rustls = "0.22.0"
+webpki-roots = "0.26.0"
 
 # =============================================================================
 #

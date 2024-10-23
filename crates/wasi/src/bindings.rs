@@ -164,6 +164,7 @@ pub mod sync {
                 "wasi:io/error": crate::bindings::io::error,
                 "wasi:filesystem/preopens": crate::bindings::filesystem::preopens,
                 "wasi:sockets/network": crate::bindings::sockets::network,
+                "wasi:sockets/tls": crate::bindings::sockets::tls,
 
                 // Configure the resource types of the bound interfaces here
                 // to be the same as the async versions of the resources, that
@@ -406,6 +407,9 @@ mod async_io {
             "wasi:sockets/udp/incoming-datagram-stream": crate::udp::IncomingDatagramStream,
             "wasi:sockets/udp/outgoing-datagram-stream": crate::udp::OutgoingDatagramStream,
             "wasi:sockets/ip-name-lookup/resolve-address-stream": crate::ip_name_lookup::ResolveAddressStream,
+            "wasi:sockets/tls/client-connection": crate::host::tls::ClientConnection,
+            "wasi:sockets/tls/client-handshake": crate::host::tls::ClientHandshake,
+            "wasi:sockets/tls/future-client-streams": crate::host::tls::FutureClientStreams,
             "wasi:filesystem/types/directory-entry-stream": crate::filesystem::ReaddirIterator,
             "wasi:filesystem/types/descriptor": crate::filesystem::Descriptor,
             "wasi:io/streams/input-stream": crate::stream::InputStream,

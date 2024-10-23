@@ -16,4 +16,6 @@ world imports {
     import tcp-create-socket;
     @since(version = 0.2.0)
     import ip-name-lookup;
+    @unstable(feature = tls)
+    import tls;
 }

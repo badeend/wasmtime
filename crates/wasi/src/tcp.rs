@@ -3,8 +3,8 @@ use crate::host::network;
 use crate::network::SocketAddressFamily;
 use crate::runtime::{with_ambient_tokio_runtime, AbortOnDropJoinHandle};
 use crate::{
-    HostInputStream, HostOutputStream, InputStream, OutputStream, SocketError, SocketResult,
-    StreamError, Subscribe,
+    HostInputStream, HostOutputStream, InputStream, OutputStream, PollableFuture, SocketError,
+    SocketResult, StreamError, Subscribe,
 };
 use anyhow::Result;
 use cap_net_ext::AddressFamily;
@@ -49,10 +49,9 @@ enum TcpState {
     },
 
     /// An outgoing connection is started via `start_connect`.
-    Connecting(Pin<Box<dyn Future<Output = io::Result<tokio::net::TcpStream>> + Send>>),
-
-    /// An outgoing connection is ready to be established.
-    ConnectReady(io::Result<tokio::net::TcpStream>),
+    Connecting(
+        PollableFuture<Pin<Box<dyn Future<Output = io::Result<tokio::net::TcpStream>> + Send>>>,
+    ),
 
     /// An outgoing connection has been established.
     Connected {
@@ -78,7 +77,6 @@ impl std::fmt::Debug for TcpState {
                 .field("pending_accept", pending_accept)
                 .finish(),
             Self::Connecting(_) => f.debug_tuple("Connecting").finish(),
-            Self::ConnectReady(_) => f.debug_tuple("ConnectReady").finish(),
             Self::Connected { .. } => f.debug_tuple("Connected").finish(),
             Self::Closed => write!(f, "Closed"),
         }
@@ -162,7 +160,6 @@ impl TcpSocket {
             TcpState::BindStarted(..)
             | TcpState::ListenStarted(..)
             | TcpState::Connecting(..)
-            | TcpState::ConnectReady(..)
             | TcpState::Closed => Err(ErrorCode::InvalidState.into()),
         }
     }
@@ -240,9 +237,7 @@ impl TcpSocket {
         match self.tcp_state {
             TcpState::Default(..) => {}
 
-            TcpState::Connecting(..) | TcpState::ConnectReady(..) => {
-                return Err(ErrorCode::ConcurrencyConflict.into())
-            }
+            TcpState::Connecting(..) => return Err(ErrorCode::ConcurrencyConflict.into()),
 
             _ => return Err(ErrorCode::InvalidState.into()),
         };
@@ -259,28 +254,18 @@ impl TcpSocket {
 
         let future = tokio_socket.connect(remote_address);
 
-        self.tcp_state = TcpState::Connecting(Box::pin(future));
+        self.tcp_state = TcpState::Connecting(PollableFuture::Pending(Box::pin(future)));
         Ok(())
     }
 
     pub fn finish_connect(&mut self) -> SocketResult<(InputStream, OutputStream)> {
-        let previous_state = std::mem::replace(&mut self.tcp_state, TcpState::Closed);
-        let result = match previous_state {
-            TcpState::ConnectReady(result) => result,
-            TcpState::Connecting(mut future) => {
-                let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-                match with_ambient_tokio_runtime(|| future.as_mut().poll(&mut cx)) {
-                    Poll::Ready(result) => result,
-                    Poll::Pending => {
-                        self.tcp_state = TcpState::Connecting(future);
-                        return Err(ErrorCode::WouldBlock.into());
-                    }
-                }
-            }
-            previous_state => {
-                self.tcp_state = previous_state;
-                return Err(ErrorCode::NotInProgress.into());
-            }
+        let TcpState::Connecting(connect) = &mut self.tcp_state else {
+            return Err(ErrorCode::NotInProgress.into());
+        };
+
+        let result = match with_ambient_tokio_runtime(|| connect.poll_noop()) {
+            Poll::Ready(_) => connect.take().unwrap_ready(),
+            Poll::Pending => return Err(ErrorCode::WouldBlock.into()),
         };
 
         match result {
@@ -472,9 +457,7 @@ impl TcpSocket {
     pub fn remote_address(&self) -> SocketResult<SocketAddr> {
         let view = match self.tcp_state {
             TcpState::Connected { .. } => self.as_std_view()?,
-            TcpState::Connecting(..) | TcpState::ConnectReady(..) => {
-                return Err(ErrorCode::ConcurrencyConflict.into())
-            }
+            TcpState::Connecting(..) => return Err(ErrorCode::ConcurrencyConflict.into()),
             _ => return Err(ErrorCode::InvalidState.into()),
         };
 
@@ -663,14 +646,11 @@ impl Subscribe for TcpSocket {
             | TcpState::BindStarted(..)
             | TcpState::Bound(..)
             | TcpState::ListenStarted(..)
-            | TcpState::ConnectReady(..)
             | TcpState::Closed
             | TcpState::Connected { .. } => {
                 // No async operation in progress.
             }
-            TcpState::Connecting(future) => {
-                self.tcp_state = TcpState::ConnectReady(future.as_mut().await);
-            }
+            TcpState::Connecting(connect) => connect.await,
             TcpState::Listening {
                 listener,
                 pending_accept,

@@ -284,7 +284,7 @@ async fn do_wasi_http_hash_all(override_send_request: bool) -> Result<()> {
                         between_bytes_timeout,
                     })
                 });
-                HostFutureIncomingResponse::ready(response)
+                HostFutureIncomingResponse::Ready(response)
             },
         ) as RequestSender)
     } else {

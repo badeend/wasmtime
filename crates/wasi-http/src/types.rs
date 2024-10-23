@@ -18,7 +18,8 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::{runtime::AbortOnDropJoinHandle, Subscribe};
+use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
+use wasmtime_wasi::PollableFuture;
 
 /// Capture the state necessary for use in the wasi-http API implementation.
 #[derive(Debug)]
@@ -291,10 +292,9 @@ pub fn default_send_request(
     request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
 ) -> HostFutureIncomingResponse {
-    let handle = wasmtime_wasi::runtime::spawn(async move {
+    PollableFuture::Pending(wasmtime_wasi::runtime::spawn(async move {
         Ok(default_send_request_handler(request, config).await)
-    });
-    HostFutureIncomingResponse::pending(handle)
+    }))
 }
 
 /// The underlying implementation of how an outgoing request is sent. This should likely be spawned
@@ -625,11 +625,6 @@ pub enum HostFields {
 
 /// An owned version of `HostFields`
 pub type FieldMap = hyper::HeaderMap;
-
-/// A handle to a future incoming response.
-pub type FutureIncomingResponseHandle =
-    AbortOnDropJoinHandle<anyhow::Result<Result<IncomingResponse, types::ErrorCode>>>;
-
 /// A response that is in the process of being received.
 #[derive(Debug)]
 pub struct IncomingResponse {
@@ -642,50 +637,6 @@ pub struct IncomingResponse {
 }
 
 /// The concrete type behind a `wasi:http/types/future-incoming-response` resource.
-#[derive(Debug)]
-pub enum HostFutureIncomingResponse {
-    /// A pending response
-    Pending(FutureIncomingResponseHandle),
-    /// The response is ready.
-    ///
-    /// An outer error will trap while the inner error gets returned to the guest.
-    Ready(anyhow::Result<Result<IncomingResponse, types::ErrorCode>>),
-    /// The response has been consumed.
-    Consumed,
-}
-
-impl HostFutureIncomingResponse {
-    /// Create a new `HostFutureIncomingResponse` that is pending on the provided task handle.
-    pub fn pending(handle: FutureIncomingResponseHandle) -> Self {
-        Self::Pending(handle)
-    }
-
-    /// Create a new `HostFutureIncomingResponse` that is ready.
-    pub fn ready(result: anyhow::Result<Result<IncomingResponse, types::ErrorCode>>) -> Self {
-        Self::Ready(result)
-    }
-
-    /// Returns `true` if the response is ready.
-    pub fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready(_))
-    }
-
-    /// Unwrap the response, panicking if it is not ready.
-    pub fn unwrap_ready(self) -> anyhow::Result<Result<IncomingResponse, types::ErrorCode>> {
-        match self {
-            Self::Ready(res) => res,
-            Self::Pending(_) | Self::Consumed => {
-                panic!("unwrap_ready called on a pending HostFutureIncomingResponse")
-            }
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Subscribe for HostFutureIncomingResponse {
-    async fn ready(&mut self) {
-        if let Self::Pending(handle) = self {
-            *self = Self::Ready(handle.await);
-        }
-    }
-}
+pub type HostFutureIncomingResponse = PollableFuture<
+    AbortOnDropJoinHandle<anyhow::Result<Result<IncomingResponse, types::ErrorCode>>>,
+>;

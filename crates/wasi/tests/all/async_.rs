@@ -1,17 +1,20 @@
 use super::*;
 use std::path::Path;
 use test_programs_artifacts::*;
-use wasmtime_wasi::add_to_linker_async;
-use wasmtime_wasi::bindings::Command;
+use wasmtime_wasi::add_to_linker_with_options_async;
+use wasmtime_wasi::bindings::{Command, LinkOptions};
 
 async fn run(path: &str, inherit_stdio: bool) -> Result<()> {
+    run_with_options(path, inherit_stdio, &LinkOptions::default()).await
+}
+async fn run_with_options(path: &str, inherit_stdio: bool, options: &LinkOptions) -> Result<()> {
     let path = Path::new(path);
     let name = path.file_stem().unwrap().to_str().unwrap();
     let engine = test_programs_artifacts::engine(|config| {
         config.async_support(true);
     });
     let mut linker = Linker::new(&engine);
-    add_to_linker_async(&mut linker)?;
+    add_to_linker_with_options_async(&mut linker, options)?;
 
     let (mut store, _td) = store(&engine, name, |builder| {
         if inherit_stdio {
@@ -334,6 +337,14 @@ async fn preview2_tcp_bind() {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn preview2_tcp_connect() {
     run(PREVIEW2_TCP_CONNECT_COMPONENT, false).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn preview2_tls_sample_application() {
+    let mut options = LinkOptions::default();
+    options.tls(true);
+    run_with_options(PREVIEW2_TLS_SAMPLE_APPLICATION_COMPONENT, false, &options)
+        .await
+        .unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn preview2_udp_sockopts() {

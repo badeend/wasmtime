@@ -1,3 +1,9 @@
+use std::{
+    future::Future,
+    pin::{pin, Pin},
+    task::{ready, Poll},
+};
+
 use crate::poll::Subscribe;
 use anyhow::Result;
 use bytes::Bytes;
@@ -263,3 +269,222 @@ impl Subscribe for Box<dyn HostInputStream> {
 pub type InputStream = Box<dyn HostInputStream>;
 
 pub type OutputStream = Box<dyn HostOutputStream>;
+
+pub struct InputAsyncRead {
+    state: AsyncReadState,
+}
+enum AsyncReadState {
+    Ready(InputStream),
+    Pending(Pin<Box<dyn Future<Output = InputStream> + Send>>),
+    Closed,
+}
+impl InputAsyncRead {
+    pub fn new(input: InputStream) -> Self {
+        InputAsyncRead {
+            state: AsyncReadState::Ready(input),
+        }
+    }
+}
+impl tokio::io::AsyncRead for InputAsyncRead {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        loop {
+            let stream = match &mut self.state {
+                AsyncReadState::Ready(stream) => stream,
+                AsyncReadState::Pending(fut) => {
+                    let stream = ready!(fut.as_mut().poll(cx));
+                    self.state = AsyncReadState::Ready(stream);
+                    if let AsyncReadState::Ready(stream) = &mut self.state {
+                        stream
+                    } else {
+                        unreachable!()
+                    }
+                }
+                AsyncReadState::Closed => return Poll::Ready(Ok(())),
+            };
+
+            // FYI, POSIX and the `AsyncRead` contract defines that a 0-byte
+            // result indicates the end of the stream. In WASI, a 0-byte result
+            // indicates that the stream isn't ready I/O right now, i.e. EWOULDBLOCK.
+            match stream.read(buf.remaining()) {
+                Ok(bytes) if bytes.is_empty() => {
+                    let AsyncReadState::Ready(mut stream) =
+                        std::mem::replace(&mut self.state, AsyncReadState::Closed)
+                    else {
+                        unreachable!()
+                    };
+
+                    self.state = AsyncReadState::Pending(Box::pin(async move {
+                        stream.ready().await;
+                        stream
+                    }));
+
+                    // Continue looping
+                }
+                Ok(bytes) => {
+                    buf.put_slice(&bytes);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(StreamError::Closed) => {
+                    self.state = AsyncReadState::Closed;
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) => {
+                    self.state = AsyncReadState::Closed;
+                    return Poll::Ready(Err(std::io::Error::other(e)));
+                }
+            }
+        }
+    }
+}
+
+pub struct OutputAsyncWrite {
+    state: AsyncWriteState,
+}
+enum AsyncWriteState {
+    Ready(OutputStream),
+    Pending(Pin<Box<dyn Future<Output = OutputStream> + Send>>),
+    Closed,
+}
+impl OutputAsyncWrite {
+    pub fn new(output: OutputStream) -> Self {
+        OutputAsyncWrite {
+            state: AsyncWriteState::Ready(output),
+        }
+    }
+}
+impl tokio::io::AsyncWrite for OutputAsyncWrite {
+    // This `poll_write` implementation interprets a write of 0 bytes as an I/O
+    // readiness check. The `poll_flush` implementation below depends on this behavior.
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::result::Result<usize, std::io::Error>> {
+        loop {
+            let stream = match &mut self.state {
+                AsyncWriteState::Ready(stream) => stream,
+                AsyncWriteState::Pending(fut) => {
+                    let stream = ready!(fut.as_mut().poll(cx));
+                    self.state = AsyncWriteState::Ready(stream);
+                    if let AsyncWriteState::Ready(stream) = &mut self.state {
+                        stream
+                    } else {
+                        unreachable!()
+                    }
+                }
+                AsyncWriteState::Closed => return Poll::Ready(Ok(0)),
+            };
+
+            // FYI, the `AsyncWrite` contract defines that a 0-byte result
+            // indicates the end of the stream. In WASI, a 0-byte result indicates
+            // that the stream isn't ready I/O right now, i.e. EWOULDBLOCK.
+            match stream.check_write() {
+                Ok(0) => {
+                    let AsyncWriteState::Ready(mut stream) =
+                        std::mem::replace(&mut self.state, AsyncWriteState::Closed)
+                    else {
+                        unreachable!()
+                    };
+
+                    self.state = AsyncWriteState::Pending(Box::pin(async move {
+                        stream.ready().await;
+                        stream
+                    }));
+
+                    // Continue looping
+                }
+                Ok(n) => {
+                    if buf.is_empty() {
+                        return Poll::Ready(Ok(0));
+                    }
+
+                    let size = n.min(buf.len());
+                    return match stream.write(Bytes::copy_from_slice(&buf[..size])) {
+                        Ok(()) => Poll::Ready(Ok(size)),
+                        Err(StreamError::Closed) => {
+                            self.state = AsyncWriteState::Closed;
+                            Poll::Ready(Ok(0))
+                        }
+                        Err(e) => {
+                            self.state = AsyncWriteState::Closed;
+                            Poll::Ready(Err(std::io::Error::other(e)))
+                        }
+                    };
+                }
+                Err(StreamError::Closed) => {
+                    self.state = AsyncWriteState::Closed;
+                    return Poll::Ready(Ok(0));
+                }
+                Err(e) => {
+                    self.state = AsyncWriteState::Closed;
+                    return Poll::Ready(Err(std::io::Error::other(e)));
+                }
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        self.poll_write(cx, &[]).map_ok(|_| ())
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        let result = ready!(self.as_mut().poll_flush(cx));
+        self.state = AsyncWriteState::Closed;
+        Poll::Ready(result)
+    }
+}
+
+pub struct DuplexAsyncReadWrite {
+    read: InputAsyncRead,
+    write: OutputAsyncWrite,
+}
+impl DuplexAsyncReadWrite {
+    pub fn new(input: InputStream, output: OutputStream) -> Self {
+        DuplexAsyncReadWrite {
+            read: InputAsyncRead::new(input),
+            write: OutputAsyncWrite::new(output),
+        }
+    }
+}
+impl tokio::io::AsyncRead for DuplexAsyncReadWrite {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        pin!(&mut self.read).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for DuplexAsyncReadWrite {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::result::Result<usize, std::io::Error>> {
+        pin!(&mut self.write).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        pin!(&mut self.write).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        pin!(&mut self.write).poll_shutdown(cx)
+    }
+}

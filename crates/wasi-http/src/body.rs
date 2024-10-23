@@ -11,6 +11,7 @@ use std::mem;
 use std::task::{Context, Poll};
 use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
+use wasmtime_wasi::PollableFuture;
 use wasmtime_wasi::{
     runtime::{poll_noop, AbortOnDropJoinHandle},
     HostInputStream, HostOutputStream, StreamError, Subscribe,
@@ -68,7 +69,40 @@ impl HostIncomingBody {
 
     /// Convert this body into a `HostFutureTrailers` resource.
     pub fn into_future_trailers(self) -> HostFutureTrailers {
-        HostFutureTrailers::Waiting(self)
+        PollableFuture::Pending(wasmtime_wasi::runtime::spawn(async move {
+            let mut hyper_body = match self.body {
+                IncomingBodyState::Start(b) => b,
+
+                // If the body is itself being read by a body stream then we
+                // need to wait for that to be done.
+                IncomingBodyState::InBodyStream(rx) => match rx.await {
+                    // The body wasn't fully read and was dropped before trailers
+                    // were reached. It's up to us now to complete the body.
+                    Ok(StreamEnd::Remaining(b)) => b,
+
+                    // Trailers were read for us and here they are, so store the
+                    // result.
+                    Ok(StreamEnd::Trailers(t)) => return Ok(t),
+
+                    // This means there were no trailers present.
+                    Err(_) => return Ok(None),
+                },
+            };
+
+            loop {
+                match hyper_body.frame().await {
+                    None => return Ok(None),
+                    Some(Err(e)) => return Err(e),
+                    Some(Ok(frame)) => {
+                        // If this frame is a data frame ignore it as we're only
+                        // interested in trailers.
+                        if let Ok(headers) = frame.into_trailers() {
+                            return Ok(Some(headers));
+                        }
+                    }
+                }
+            }
+        }))
     }
 }
 
@@ -299,88 +333,8 @@ impl Drop for HostIncomingBodyStream {
 }
 
 /// The concrete type behind a `wasi:http/types/future-trailers` resource.
-#[derive(Debug)]
-pub enum HostFutureTrailers {
-    /// Trailers aren't here yet.
-    ///
-    /// This state represents two similar states:
-    ///
-    /// * The body is here and ready for reading and we're waiting to read
-    ///   trailers. This can happen for example when the actual body wasn't read
-    ///   or if the body was only partially read.
-    ///
-    /// * The body is being read by something else and we're waiting for that to
-    ///   send us the trailers (or the body itself). This state will get entered
-    ///   when the body stream is dropped for example. If the body stream reads
-    ///   the trailers itself it will also send a message over here with the
-    ///   trailers.
-    Waiting(HostIncomingBody),
-
-    /// Trailers are ready and here they are.
-    ///
-    /// Note that `Ok(None)` means that there were no trailers for this request
-    /// while `Ok(Some(_))` means that trailers were found in the request.
-    Done(Result<Option<FieldMap>, types::ErrorCode>),
-
-    /// Trailers have been consumed by `future-trailers.get`.
-    Consumed,
-}
-
-#[async_trait::async_trait]
-impl Subscribe for HostFutureTrailers {
-    async fn ready(&mut self) {
-        let body = match self {
-            HostFutureTrailers::Waiting(body) => body,
-            HostFutureTrailers::Done(_) => return,
-            HostFutureTrailers::Consumed => return,
-        };
-
-        // If the body is itself being read by a body stream then we need to
-        // wait for that to be done.
-        if let IncomingBodyState::InBodyStream(rx) = &mut body.body {
-            match rx.await {
-                // Trailers were read for us and here they are, so store the
-                // result.
-                Ok(StreamEnd::Trailers(t)) => *self = Self::Done(Ok(t)),
-
-                // The body wasn't fully read and was dropped before trailers
-                // were reached. It's up to us now to complete the body.
-                Ok(StreamEnd::Remaining(b)) => body.body = IncomingBodyState::Start(b),
-
-                // This means there were no trailers present.
-                Err(_) => {
-                    *self = HostFutureTrailers::Done(Ok(None));
-                }
-            }
-        }
-
-        // Here it should be guaranteed that `InBodyStream` is now gone, so if
-        // we have the body ourselves then read frames until trailers are found.
-        let body = match self {
-            HostFutureTrailers::Waiting(body) => body,
-            HostFutureTrailers::Done(_) => return,
-            HostFutureTrailers::Consumed => return,
-        };
-        let hyper_body = match &mut body.body {
-            IncomingBodyState::Start(body) => body,
-            IncomingBodyState::InBodyStream(_) => unreachable!(),
-        };
-        let result = loop {
-            match hyper_body.frame().await {
-                None => break Ok(None),
-                Some(Err(e)) => break Err(e),
-                Some(Ok(frame)) => {
-                    // If this frame is a data frame ignore it as we're only
-                    // interested in trailers.
-                    if let Ok(headers) = frame.into_trailers() {
-                        break Ok(Some(headers));
-                    }
-                }
-            }
-        };
-        *self = HostFutureTrailers::Done(result);
-    }
-}
+pub type HostFutureTrailers =
+    PollableFuture<AbortOnDropJoinHandle<Result<Option<FieldMap>, types::ErrorCode>>>;
 
 #[derive(Debug, Clone)]
 struct WrittenState {

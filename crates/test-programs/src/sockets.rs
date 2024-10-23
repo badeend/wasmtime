@@ -9,6 +9,7 @@ use crate::wasi::sockets::network::{
     Network,
 };
 use crate::wasi::sockets::tcp::TcpSocket;
+use crate::wasi::sockets::tls;
 use crate::wasi::sockets::udp::{
     IncomingDatagram, IncomingDatagramStream, OutgoingDatagram, OutgoingDatagramStream, UdpSocket,
 };
@@ -260,6 +261,39 @@ impl IncomingDatagramStream {
                     }
                 }
                 Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+impl tls::ClientHandshake {
+    pub fn blocking_finish(self) -> Result<(tls::ClientConnection, InputStream, OutputStream), ()> {
+        let future = tls::ClientHandshake::finish(self);
+        let timeout = monotonic_clock::subscribe_duration(TIMEOUT_NS);
+        let pollable = future.subscribe();
+
+        loop {
+            match future.get() {
+                None => pollable.block_until(&timeout).expect("timed out"),
+                Some(Ok(r)) => return r,
+                Some(Err(_)) => unreachable!(),
+            }
+        }
+    }
+}
+
+impl tls::ClientConnection {
+    pub fn blocking_close_notify(
+        &self,
+        output: &OutputStream,
+    ) -> Result<(), crate::wasi::io::error::Error> {
+        let timeout = monotonic_clock::subscribe_duration(TIMEOUT_NS);
+        let pollable = output.subscribe();
+
+        loop {
+            match self.close_notify() {
+                None => pollable.block_until(&timeout).expect("timed out"),
+                Some(result) => return result,
             }
         }
     }

@@ -211,7 +211,7 @@ pub use self::ctx::{WasiCtx, WasiCtxBuilder, WasiImpl, WasiView};
 pub use self::error::{I32Exit, TrappableError};
 pub use self::filesystem::{DirPerms, FileInputStream, FilePerms, FsError, FsResult};
 pub use self::network::{Network, SocketAddrUse, SocketError, SocketResult};
-pub use self::poll::{subscribe, ClosureFuture, MakeFuture, Pollable, PollableFuture, Subscribe};
+pub use self::poll::{subscribe, Pollable, PollableFuture, Subscribe};
 pub use self::random::{thread_rng, Deterministic};
 pub use self::stdio::{
     stderr, stdin, stdout, AsyncStdinStream, AsyncStdoutStream, IsATTY, OutputFile, Stderr, Stdin,
@@ -325,6 +325,7 @@ pub fn add_to_linker_with_options_async<T: WasiView>(
     crate::bindings::sockets::instance_network::add_to_linker_get_host(l, closure)?;
     crate::bindings::sockets::network::add_to_linker_get_host(l, &options.into(), closure)?;
     crate::bindings::sockets::ip_name_lookup::add_to_linker_get_host(l, closure)?;
+    crate::bindings::sockets::tls::add_to_linker_get_host(l, &options.into(), closure)?;
     Ok(())
 }
 
@@ -424,6 +425,7 @@ pub fn add_to_linker_with_options_sync<T: WasiView>(
     crate::bindings::sockets::instance_network::add_to_linker_get_host(l, closure)?;
     crate::bindings::sockets::network::add_to_linker_get_host(l, &options.into(), closure)?;
     crate::bindings::sockets::ip_name_lookup::add_to_linker_get_host(l, closure)?;
+    crate::bindings::sync::sockets::tls::add_to_linker_get_host(l, &options.into(), closure)?;
     Ok(())
 }
 

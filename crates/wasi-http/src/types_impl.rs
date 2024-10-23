@@ -16,7 +16,7 @@ use std::str::FromStr;
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::{
     bindings::io::streams::{InputStream, OutputStream},
-    Pollable, ResourceTableError,
+    Pollable, PollableFuture, ResourceTableError,
 };
 
 impl<T> crate::bindings::http::types::Host for WasiHttpImpl<T>
@@ -668,22 +668,14 @@ where
         id: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Option<Result<Result<Option<Resource<Trailers>>, types::ErrorCode>, ()>>>
     {
-        let trailers = self.table().get_mut(&id)?;
-        match trailers {
-            HostFutureTrailers::Waiting(_) => return Ok(None),
-            HostFutureTrailers::Consumed => return Ok(Some(Err(()))),
-            HostFutureTrailers::Done(_) => {}
-        };
-
-        let res = match std::mem::replace(trailers, HostFutureTrailers::Consumed) {
-            HostFutureTrailers::Done(res) => res,
-            _ => unreachable!(),
-        };
-
-        let mut fields = match res {
-            Ok(Some(fields)) => fields,
-            Ok(None) => return Ok(Some(Ok(Ok(None)))),
-            Err(e) => return Ok(Some(Ok(Err(e)))),
+        let mut fields = match self.table().get_mut(&id)? {
+            t @ PollableFuture::Ready(_) => match t.take().unwrap_ready() {
+                Ok(Some(fields)) => fields,
+                Ok(None) => return Ok(Some(Ok(Ok(None)))),
+                Err(e) => return Ok(Some(Ok(Err(e)))),
+            },
+            PollableFuture::Pending(_) => return Ok(None),
+            PollableFuture::Consumed => return Ok(Some(Err(()))),
         };
 
         remove_forbidden_headers(self, &mut fields);
@@ -835,25 +827,19 @@ where
     ) -> wasmtime::Result<
         Option<Result<Result<Resource<HostIncomingResponse>, types::ErrorCode>, ()>>,
     > {
-        let resp = self.table().get_mut(&id)?;
-
-        match resp {
-            HostFutureIncomingResponse::Pending(_) => return Ok(None),
-            HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
-            HostFutureIncomingResponse::Ready(_) => {}
-        }
-
-        let resp =
-            match std::mem::replace(resp, HostFutureIncomingResponse::Consumed).unwrap_ready() {
+        let resp = match self.table().get_mut(&id)? {
+            r @ PollableFuture::Ready(_) => match r.take().unwrap_ready() {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => return Ok(Some(Ok(Err(e)))),
                 Err(e) => {
                     // Trapping if it's not possible to downcast to an wasi-http error
                     let e = e.downcast::<types::ErrorCode>()?;
                     return Ok(Some(Ok(Err(e))));
                 }
-
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => return Ok(Some(Ok(Err(e)))),
-            };
+            },
+            PollableFuture::Pending(_) => return Ok(None),
+            PollableFuture::Consumed => return Ok(Some(Err(()))),
+        };
 
         let (mut parts, body) = resp.resp.into_parts();
 

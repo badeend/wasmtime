@@ -1,15 +1,18 @@
 use super::*;
 use std::path::Path;
 use test_programs_artifacts::*;
-use wasmtime_wasi::add_to_linker_sync;
-use wasmtime_wasi::bindings::sync::Command;
+use wasmtime_wasi::add_to_linker_with_options_sync;
+use wasmtime_wasi::bindings::sync::{Command, LinkOptions};
 
 fn run(path: &str, inherit_stdio: bool) -> Result<()> {
+    run_with_options(path, inherit_stdio, &LinkOptions::default())
+}
+fn run_with_options(path: &str, inherit_stdio: bool, options: &LinkOptions) -> Result<()> {
     let path = Path::new(path);
     let name = path.file_stem().unwrap().to_str().unwrap();
     let engine = test_programs_artifacts::engine(|_| {});
     let mut linker = Linker::new(&engine);
-    add_to_linker_sync(&mut linker)?;
+    add_to_linker_with_options_sync(&mut linker, options)?;
 
     let component = Component::from_file(&engine, path)?;
 
@@ -280,6 +283,12 @@ fn preview2_tcp_bind() {
 #[test_log::test]
 fn preview2_tcp_connect() {
     run(PREVIEW2_TCP_CONNECT_COMPONENT, false).unwrap()
+}
+#[test_log::test]
+fn preview2_tls_sample_application() {
+    let mut options = LinkOptions::default();
+    options.tls(true);
+    run_with_options(PREVIEW2_TLS_SAMPLE_APPLICATION_COMPONENT, false, &options).unwrap()
 }
 #[test_log::test]
 fn preview2_udp_sockopts() {

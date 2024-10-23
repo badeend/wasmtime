@@ -35,6 +35,9 @@ async-trait = { workspace = true }
 system-interface = { workspace = true}
 futures = { workspace = true }
 url = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["time", "sync", "io-std", "io-util", "rt", "rt-multi-thread", "net", "macros", "fs"] }
