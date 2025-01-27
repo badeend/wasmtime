@@ -15,7 +15,7 @@ interface types {
   /// This type corresponds to HTTP standard Methods.
   @since(version = 0.2.0)
   variant method {
-    get,
+    %get,
     head,
     post,
     put,
@@ -205,7 +205,7 @@ interface types {
     /// However, if the name is present but empty, this is represented by a list
     /// with one or more empty field-values present.
     @since(version = 0.2.0)
-    get: func(name: field-name) -> list<field-value>;
+    %get: func(name: field-name) -> list<field-value>;
 
     /// Returns `true` when the name is present in this `fields`. If the name is
     /// syntactically invalid, `false` is returned.
@@ -220,7 +220,7 @@ interface types {
     /// Fails with `header-error.invalid-syntax` if the `field-name` or any of
     /// the `field-value`s are syntactically invalid.
     @since(version = 0.2.0)
-    set: func(name: field-name, value: list<field-value>) -> result<_, header-error>;
+    %set: func(name: field-name, value: list<field-value>) -> result<_, header-error>;
 
     /// Delete all values for a name. Does nothing if no values for the name
     /// exist.
@@ -446,7 +446,7 @@ interface types {
     /// The user may provide an `error` to `response` to allow the
     /// implementation determine how to respond with an HTTP error response.
     @since(version = 0.2.0)
-    set: static func(
+    %set: static func(
       param: response-outparam,
       response: result<outgoing-response, error-code>,
     );
@@ -549,7 +549,7 @@ interface types {
     /// `delete` methods will return an error, and the resource must be
     /// dropped before the parent `future-trailers` is dropped.
     @since(version = 0.2.0)
-    get: func() -> option<result<result<option<trailers>, error-code>>>;
+    %get: func() -> option<result<result<option<trailers>, error-code>>>;
   }
 
   /// Represents an outgoing HTTP Response.
@@ -668,6 +668,6 @@ interface types {
     /// but those will be reported by the `incoming-body` and its
     /// `output-stream` child.
     @since(version = 0.2.0)
-    get: func() -> option<result<result<incoming-response, error-code>>>;
+    %get: func() -> option<result<result<incoming-response, error-code>>>;
   }
 }

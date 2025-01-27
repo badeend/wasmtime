@@ -76,7 +76,7 @@ interface store {
         /// store, it returns `Ok(none)`. 
         ///
         /// If any other error occurs, it returns an `Err(error)`.
-        get: func(key: string) -> result<option<list<u8>>, error>;
+        %get: func(key: string) -> result<option<list<u8>>, error>;
 
         /// Set the value associated with the key in the store. If the key already
         /// exists in the store, it overwrites the value.
@@ -84,7 +84,7 @@ interface store {
         /// If the key does not exist in the store, it creates a new key-value pair.
         /// 
         /// If any other error occurs, it returns an `Err(error)`.
-        set: func(key: string, value: list<u8>) -> result<_, error>;
+        %set: func(key: string, value: list<u8>) -> result<_, error>;
 
         /// Delete the key-value pair associated with the key in the store.
         /// 

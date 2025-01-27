@@ -772,6 +772,8 @@ fn _new(
                             generator.define_rust_guest_export(resolve, Some(name), func);
                         }
                         FunctionKind::Method(id)
+                        | FunctionKind::Getter(id)
+                        | FunctionKind::Setter(id)
                         | FunctionKind::Constructor(id)
                         | FunctionKind::Static(id) => {
                             resource_methods.entry(id).or_insert(Vec::new()).push(func);
@@ -1926,6 +1928,8 @@ impl<'a> InterfaceGenerator<'a> {
                 FunctionKind::Freestanding => false,
                 FunctionKind::Method(resource)
                 | FunctionKind::Static(resource)
+                | FunctionKind::Getter(resource)
+                | FunctionKind::Setter(resource)
                 | FunctionKind::Constructor(resource) => id == resource,
             });
 
@@ -3047,7 +3051,11 @@ impl<'a> InterfaceGenerator<'a> {
                 ),
                 _ => "Host".to_string(),
             },
-            FunctionKind::Method(id) | FunctionKind::Static(id) | FunctionKind::Constructor(id) => {
+            FunctionKind::Method(id)
+            | FunctionKind::Getter(id)
+            | FunctionKind::Setter(id)
+            | FunctionKind::Static(id)
+            | FunctionKind::Constructor(id) => {
                 let resource = self.resolve.types[id]
                     .name
                     .as_ref()
@@ -3733,7 +3741,10 @@ fn resolve_type_definition_id(resolve: &Resolve, mut id: TypeId) -> TypeId {
 
 fn rust_function_name(func: &Function) -> String {
     match func.kind {
-        FunctionKind::Method(_) | FunctionKind::Static(_) => to_rust_ident(func.item_name()),
+        FunctionKind::Method(_) | FunctionKind::Getter(_) | FunctionKind::Static(_) => {
+            to_rust_ident(func.item_name())
+        }
+        FunctionKind::Setter(_) => format!("set_{}", to_rust_ident(func.item_name())),
         FunctionKind::Constructor(_) => "new".to_string(),
         FunctionKind::Freestanding => to_rust_ident(&func.name),
     }
@@ -3744,6 +3755,16 @@ fn func_field_name(resolve: &Resolve, func: &Function) -> String {
     match func.kind {
         FunctionKind::Method(id) => {
             name.push_str("method-");
+            name.push_str(resolve.types[id].name.as_ref().unwrap());
+            name.push_str("-");
+        }
+        FunctionKind::Getter(id) => {
+            name.push_str("get-");
+            name.push_str(resolve.types[id].name.as_ref().unwrap());
+            name.push_str("-");
+        }
+        FunctionKind::Setter(id) => {
+            name.push_str("set-");
             name.push_str(resolve.types[id].name.as_ref().unwrap());
             name.push_str("-");
         }
@@ -3820,6 +3841,8 @@ fn concurrent_constraints<'a>(
                     .any(|func| match func.kind {
                         FunctionKind::Freestanding => false,
                         FunctionKind::Method(resource)
+                        | FunctionKind::Getter(resource)
+                        | FunctionKind::Setter(resource)
                         | FunctionKind::Static(resource)
                         | FunctionKind::Constructor(resource) => {
                             *ty == resource
@@ -3885,6 +3908,8 @@ fn world_imports_concurrent_constraints<'a>(
                             WorldItem::Function(func) => match func.kind {
                                 FunctionKind::Freestanding => false,
                                 FunctionKind::Method(resource)
+                                | FunctionKind::Getter(resource)
+                                | FunctionKind::Setter(resource)
                                 | FunctionKind::Static(resource)
                                 | FunctionKind::Constructor(resource) => {
                                     *ty == resource

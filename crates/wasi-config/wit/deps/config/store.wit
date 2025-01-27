@@ -18,7 +18,7 @@ interface store {
     /// 
     /// The value is returned as an `option<string>`. If the key is not found,
     /// `Ok(none)` is returned. If an error occurs, an `Err(error)` is returned.
-    get: func(
+    %get: func(
         /// A string key to fetch
         key: string
     ) -> result<option<string>, error>;

@@ -298,20 +298,20 @@ io-lifetimes = { version = "2.0.3", default-features = false }
 io-extras = "0.18.1"
 rustix = "0.38.43"
 # wit-bindgen:
-wit-bindgen = { version = "0.38.0", default-features = false }
-wit-bindgen-rust-macro = { version = "0.38.0", default-features = false }
+wit-bindgen = { git = "https://github.com/badeend/wit-bindgen", branch = "get-set", default-features = false }
+wit-bindgen-rust-macro = { git = "https://github.com/badeend/wit-bindgen", branch = "get-set", default-features = false }
 
 # wasm-tools family:
-wasmparser = { version = "0.224.0", default-features = false, features = ['simd'] }
-wat = "1.224.0"
-wast = "224.0.0"
-wasmprinter = "0.224.0"
-wasm-encoder = "0.224.0"
-wasm-smith = "0.224.0"
-wasm-mutate = "0.224.0"
-wit-parser = "0.224.0"
-wit-component = "0.224.0"
-wasm-wave = "0.224.0"
+wasmparser = { git = "https://github.com/badeend/wasm-tools", branch = "get-set", default-features = false, features = ['simd'] }
+wat = { git = "https://github.com/badeend/wasm-tools", branch = "get-set" }
+wast = { git = "https://github.com/badeend/wasm-tools", branch = "get-set" }
+wasmprinter = { git = "https://github.com/badeend/wasm-tools", branch = "get-set" }
+wasm-encoder = { git = "https://github.com/badeend/wasm-tools", branch = "get-set" }
+wasm-smith = { git = "https://github.com/badeend/wasm-tools", branch = "get-set" }
+wasm-mutate = { git = "https://github.com/badeend/wasm-tools", branch = "get-set" }
+wit-parser = { git = "https://github.com/badeend/wasm-tools", branch = "get-set" }
+wit-component = { git = "https://github.com/badeend/wasm-tools", branch = "get-set" }
+wasm-wave = { git = "https://github.com/badeend/wasm-tools", branch = "get-set" }
 
 # Non-Bytecode Alliance maintained dependencies:
 # --------------------------

@@ -10,8 +10,8 @@ bindgen!({
             /// An example of exporting an interface inline and naming it
             /// directly.
             export environment: interface {
-                get: func(var: string) -> string;
-                set: func(var: string, val: string);
+                %get: func(var: string) -> string;
+                %set: func(var: string, val: string);
             }
 
             /// An example of exporting an interface.
