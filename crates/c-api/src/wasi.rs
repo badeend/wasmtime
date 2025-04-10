@@ -106,7 +106,7 @@ pub unsafe extern "C" fn wasi_config_set_stdin_file(
 
     let file = tokio::fs::File::from_std(file);
     let stdin_stream =
-        wasmtime_wasi::AsyncStdinStream::new(wasmtime_wasi::pipe::AsyncReadStream::new(file));
+        wasmtime_wasi::AsyncStdinStream::new(wasmtime_wasi::pipe::AsyncReadStream::new(4096, file));
     config.builder.stdin(stdin_stream);
 
     true

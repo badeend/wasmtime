@@ -234,6 +234,7 @@
 
 use wasmtime::component::Linker;
 
+mod async_streams;
 pub mod bindings;
 mod clocks;
 mod ctx;
@@ -254,7 +255,6 @@ mod stdio;
 mod tcp;
 mod udp;
 mod view;
-mod write_stream;
 
 pub use self::clocks::{HostMonotonicClock, HostWallClock};
 pub use self::ctx::{WasiCtx, WasiCtxBuilder};

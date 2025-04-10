@@ -58,7 +58,7 @@ impl StdinStream for pipe::ClosedInputStream {
     }
 }
 
-/// An impl of [`StdinStream`] built on top of [`crate::pipe::AsyncReadStream`].
+/// An impl of [`StdinStream`] built on top of [`crate::InputStream`].
 //
 // Note the usage of `tokio::sync::Mutex` here as opposed to a
 // `std::sync::Mutex`. This is intentionally done to implement the `Pollable`
@@ -86,10 +86,10 @@ impl StdinStream for pipe::ClosedInputStream {
 // between the two at this time. This may all change in the future with WASI
 // 0.3, but perhaps we'll have a better story for stdio at that time (see the
 // doc block on the `OutputStream` impl below)
-pub struct AsyncStdinStream(Arc<Mutex<crate::pipe::AsyncReadStream>>);
+pub struct AsyncStdinStream(Arc<Mutex<dyn InputStream>>);
 
 impl AsyncStdinStream {
-    pub fn new(s: crate::pipe::AsyncReadStream) -> Self {
+    pub fn new(s: impl InputStream) -> Self {
         Self(Arc::new(Mutex::new(s)))
     }
 }
@@ -326,17 +326,17 @@ impl Pollable for StdioOutputStream {
     async fn ready(&mut self) {}
 }
 
-/// A wrapper of [`crate::pipe::AsyncWriteStream`] that implements
+/// A wrapper of [`crate::OutputStream`] that implements
 /// [`StdoutStream`]. Note that the [`OutputStream`] impl for this is not
 /// correct when used for interleaved async IO.
 //
 // Note that the use of `tokio::sync::Mutex` here is intentional, in addition to
 // the `try_lock()` calls below in the implementation of `OutputStream`. For
 // more information see the documentation on `AsyncStdinStream`.
-pub struct AsyncStdoutStream(Arc<Mutex<crate::pipe::AsyncWriteStream>>);
+pub struct AsyncStdoutStream(Arc<Mutex<dyn OutputStream>>);
 
 impl AsyncStdoutStream {
-    pub fn new(s: crate::pipe::AsyncWriteStream) -> Self {
+    pub fn new(s: impl OutputStream) -> Self {
         Self(Arc::new(Mutex::new(s)))
     }
 }
@@ -504,8 +504,8 @@ where
 
 #[cfg(test)]
 mod test {
+    use crate::pipe::AsyncWriteStream;
     use crate::stdio::StdoutStream;
-    use crate::write_stream::AsyncWriteStream;
     use crate::{AsyncStdoutStream, OutputStream};
     use anyhow::Result;
     use bytes::Bytes;
@@ -560,22 +560,21 @@ mod test {
         let file = tokio::fs::File::open(&path)
             .await
             .expect("open created file");
-        let stdin_stream = super::AsyncStdinStream::new(crate::pipe::AsyncReadStream::new(file));
+        let stdin_stream =
+            super::AsyncStdinStream::new(crate::pipe::AsyncReadStream::new(1024, file));
 
         use super::StdinStream;
 
         let mut view1 = stdin_stream.stream();
         let mut view2 = stdin_stream.stream();
 
-        view1.ready().await;
-
-        let read1 = view1.read(10).expect("read first 10 bytes");
+        let read1 = view1.blocking_read(10).await.expect("read first 10 bytes");
         assert_eq!(read1, "the quick ".as_bytes(), "first 10 bytes");
-        let read2 = view2.read(10).expect("read second 10 bytes");
+        let read2 = view2.blocking_read(10).await.expect("read second 10 bytes");
         assert_eq!(read2, "brown fox ".as_bytes(), "second 10 bytes");
-        let read3 = view1.read(10).expect("read third 10 bytes");
+        let read3 = view1.blocking_read(10).await.expect("read third 10 bytes");
         assert_eq!(read3, "jumped ove".as_bytes(), "third 10 bytes");
-        let read4 = view2.read(10).expect("read fourth 10 bytes");
+        let read4 = view2.blocking_read(10).await.expect("read fourth 10 bytes");
         assert_eq!(read4, "r the thre".as_bytes(), "fourth 10 bytes");
     }
 

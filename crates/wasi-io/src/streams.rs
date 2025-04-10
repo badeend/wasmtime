@@ -73,6 +73,32 @@ pub trait InputStream: Pollable {
     async fn cancel(&mut self) {}
 }
 
+#[async_trait::async_trait]
+impl InputStream for DynInputStream {
+    fn read(&mut self, size: usize) -> StreamResult<Bytes> {
+        self.as_mut().read(size)
+    }
+    async fn blocking_read(&mut self, size: usize) -> StreamResult<Bytes> {
+        self.as_mut().blocking_read(size).await
+    }
+    fn skip(&mut self, nelem: usize) -> StreamResult<usize> {
+        self.as_mut().skip(nelem)
+    }
+    async fn blocking_skip(&mut self, nelem: usize) -> StreamResult<usize> {
+        self.as_mut().blocking_skip(nelem).await
+    }
+    async fn cancel(&mut self) {
+        self.as_mut().cancel().await
+    }
+}
+
+#[async_trait::async_trait]
+impl Pollable for DynInputStream {
+    async fn ready(&mut self) {
+        self.as_mut().ready().await
+    }
+}
+
 /// Representation of the `error` resource type in the `wasi:io/error`
 /// interface.
 ///
@@ -284,16 +310,37 @@ pub trait OutputStream: Pollable {
 }
 
 #[async_trait::async_trait]
-impl Pollable for Box<dyn OutputStream> {
-    async fn ready(&mut self) {
-        (**self).ready().await
+impl OutputStream for DynOutputStream {
+    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
+        self.as_mut().write(bytes)
+    }
+    fn flush(&mut self) -> StreamResult<()> {
+        self.as_mut().flush()
+    }
+    fn check_write(&mut self) -> StreamResult<usize> {
+        self.as_mut().check_write()
+    }
+    async fn blocking_write_and_flush(&mut self, bytes: Bytes) -> StreamResult<()> {
+        self.as_mut().blocking_write_and_flush(bytes).await
+    }
+    fn write_zeroes(&mut self, nelem: usize) -> StreamResult<()> {
+        self.as_mut().write_zeroes(nelem)
+    }
+    async fn blocking_write_zeroes_and_flush(&mut self, nelem: usize) -> StreamResult<()> {
+        self.as_mut().blocking_write_zeroes_and_flush(nelem).await
+    }
+    async fn write_ready(&mut self) -> StreamResult<usize> {
+        self.as_mut().write_ready().await
+    }
+    async fn cancel(&mut self) {
+        self.as_mut().cancel().await
     }
 }
 
 #[async_trait::async_trait]
-impl Pollable for Box<dyn InputStream> {
+impl Pollable for DynOutputStream {
     async fn ready(&mut self) {
-        (**self).ready().await
+        self.as_mut().ready().await
     }
 }
 

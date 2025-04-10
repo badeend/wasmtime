@@ -40,6 +40,11 @@ pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| 
 #[derive(Debug)]
 pub struct AbortOnDropJoinHandle<T>(tokio::task::JoinHandle<T>);
 impl<T> AbortOnDropJoinHandle<T> {
+    /// Notify the task that it should stop executing as soon as possible.
+    pub fn abort(&mut self) {
+        self.0.abort();
+    }
+
     /// Abort the task and wait for it to finish. Optionally returns the result
     /// of the task if it ran to completion prior to being aborted.
     pub async fn cancel(mut self) -> Option<T> {

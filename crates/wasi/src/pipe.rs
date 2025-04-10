@@ -10,13 +10,12 @@
 use anyhow::anyhow;
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 use wasmtime_wasi_io::{
     poll::Pollable,
     streams::{InputStream, OutputStream, StreamError},
 };
 
-pub use crate::write_stream::AsyncWriteStream;
+pub use crate::async_streams::*;
 
 #[derive(Debug, Clone)]
 pub struct MemoryInputPipe {
@@ -108,112 +107,6 @@ impl OutputStream for MemoryOutputPipe {
 #[async_trait::async_trait]
 impl Pollable for MemoryOutputPipe {
     async fn ready(&mut self) {}
-}
-
-/// Provides a [`InputStream`] impl from a [`tokio::io::AsyncRead`] impl
-pub struct AsyncReadStream {
-    closed: bool,
-    buffer: Option<Result<Bytes, StreamError>>,
-    receiver: mpsc::Receiver<Result<Bytes, StreamError>>,
-    join_handle: Option<crate::runtime::AbortOnDropJoinHandle<()>>,
-}
-
-impl AsyncReadStream {
-    /// Create a [`AsyncReadStream`]. In order to use the [`InputStream`] impl
-    /// provided by this struct, the argument must impl [`tokio::io::AsyncRead`].
-    pub fn new<T: tokio::io::AsyncRead + Send + Unpin + 'static>(mut reader: T) -> Self {
-        let (sender, receiver) = mpsc::channel(1);
-        let join_handle = crate::runtime::spawn(async move {
-            loop {
-                use tokio::io::AsyncReadExt;
-                let mut buf = bytes::BytesMut::with_capacity(4096);
-                let sent = match reader.read_buf(&mut buf).await {
-                    Ok(nbytes) if nbytes == 0 => sender.send(Err(StreamError::Closed)).await,
-                    Ok(_) => sender.send(Ok(buf.freeze())).await,
-                    Err(e) => {
-                        sender
-                            .send(Err(StreamError::LastOperationFailed(e.into())))
-                            .await
-                    }
-                };
-                if sent.is_err() {
-                    // no more receiver - stop trying to read
-                    break;
-                }
-            }
-        });
-        AsyncReadStream {
-            closed: false,
-            buffer: None,
-            receiver,
-            join_handle: Some(join_handle),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl InputStream for AsyncReadStream {
-    fn read(&mut self, size: usize) -> Result<Bytes, StreamError> {
-        use mpsc::error::TryRecvError;
-
-        match self.buffer.take() {
-            Some(Ok(mut bytes)) => {
-                // TODO: de-duplicate the buffer management with the case below
-                let len = bytes.len().min(size);
-                let rest = bytes.split_off(len);
-                if !rest.is_empty() {
-                    self.buffer = Some(Ok(rest));
-                }
-                return Ok(bytes);
-            }
-            Some(Err(e)) => {
-                self.closed = true;
-                return Err(e);
-            }
-            None => {}
-        }
-
-        match self.receiver.try_recv() {
-            Ok(Ok(mut bytes)) => {
-                let len = bytes.len().min(size);
-                let rest = bytes.split_off(len);
-                if !rest.is_empty() {
-                    self.buffer = Some(Ok(rest));
-                }
-
-                Ok(bytes)
-            }
-            Ok(Err(e)) => {
-                self.closed = true;
-                Err(e)
-            }
-            Err(TryRecvError::Empty) => Ok(Bytes::new()),
-            Err(TryRecvError::Disconnected) => Err(StreamError::Trap(anyhow!(
-                "AsyncReadStream sender died - should be impossible"
-            ))),
-        }
-    }
-
-    async fn cancel(&mut self) {
-        match self.join_handle.take() {
-            Some(task) => _ = task.cancel().await,
-            None => {}
-        }
-    }
-}
-#[async_trait::async_trait]
-impl Pollable for AsyncReadStream {
-    async fn ready(&mut self) {
-        if self.buffer.is_some() || self.closed {
-            return;
-        }
-        match self.receiver.recv().await {
-            Some(res) => self.buffer = Some(res),
-            None => {
-                panic!("no more sender for an open AsyncReadStream - should be impossible")
-            }
-        }
-    }
 }
 
 /// An output stream that consumes all input written to it, and is always ready.
@@ -324,7 +217,7 @@ mod test {
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn empty_read_stream() {
-        let mut reader = AsyncReadStream::new(tokio::io::empty());
+        let mut reader = AsyncReadStream::new(1024, tokio::io::empty());
 
         // In a multi-threaded context, the value of state is not deterministic -- the spawned
         // reader task may run on a different thread.
@@ -344,7 +237,7 @@ mod test {
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn infinite_read_stream() {
-        let mut reader = AsyncReadStream::new(tokio::io::repeat(0));
+        let mut reader = AsyncReadStream::new(1024, tokio::io::repeat(0));
 
         let bs = reader.read(10).unwrap();
         if bs.is_empty() {
@@ -374,7 +267,7 @@ mod test {
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn finite_read_stream() {
-        let mut reader = AsyncReadStream::new(finite_async_reader(&[1; 123]).await);
+        let mut reader = AsyncReadStream::new(1024, finite_async_reader(&[1; 123]).await);
 
         let bs = reader.read(123).unwrap();
         if bs.is_empty() {
@@ -389,14 +282,14 @@ mod test {
 
         // The AsyncRead's should be empty now, but we have a race where the reader task hasn't
         // yet send that to the AsyncReadStream.
-        match reader.read(0) {
+        match reader.read(1) {
             Err(StreamError::Closed) => {} // Correct!
             Ok(bs) => {
                 assert!(bs.is_empty());
                 // Need to await to give this side time to catch up
                 resolves_immediately(reader.ready()).await;
                 // Now a read should show closed
-                assert!(matches!(reader.read(0), Err(StreamError::Closed)));
+                assert!(matches!(reader.read(1), Err(StreamError::Closed)));
             }
             res => panic!("unexpected: {res:?}"),
         }
@@ -407,7 +300,7 @@ mod test {
     // written, with the proper indications of readiness for reading:
     async fn multiple_chunks_read_stream() {
         let (r, mut w) = simplex(1024);
-        let mut reader = AsyncReadStream::new(r);
+        let mut reader = AsyncReadStream::new(1024, r);
 
         w.write_all(&[123]).await.unwrap();
 
@@ -472,7 +365,7 @@ mod test {
     // behavior at some point, but this test shows the behavior as it is implemented:
     async fn backpressure_read_stream() {
         let (r, mut w) = simplex(16 * 1024); // Make sure this buffer isn't a bottleneck
-        let mut reader = AsyncReadStream::new(r);
+        let mut reader = AsyncReadStream::new(4096, r);
 
         let writer_task = tokio::task::spawn(async move {
             // Write twice as much as we can buffer up in an AsyncReadStream:
@@ -484,7 +377,7 @@ mod test {
 
         // Now we expect the reader task has sent 4k from the stream to the reader.
         // Try to read out one bigger than the buffer available:
-        let bs = reader.read(4097).unwrap();
+        let bs = reader.blocking_read(4097).await.unwrap();
         assert_eq!(bs.len(), 4096);
 
         // Allow the crank to turn more:
@@ -492,7 +385,7 @@ mod test {
 
         // Again we expect the reader task has sent 4k from the stream to the reader.
         // Try to read out one bigger than the buffer available:
-        let bs = reader.read(4097).unwrap();
+        let bs = reader.blocking_read(4097).await.unwrap();
         assert_eq!(bs.len(), 4096);
 
         // The writer task is now finished - join with it:
@@ -505,7 +398,10 @@ mod test {
         resolves_immediately(reader.ready()).await;
 
         // Now we expect the reader to be empty, and the stream closed:
-        assert!(matches!(reader.read(4097), Err(StreamError::Closed)));
+        assert!(matches!(
+            reader.blocking_read(4097).await,
+            Err(StreamError::Closed)
+        ));
     }
 
     #[test_log::test(test_log::test(tokio::test(flavor = "multi_thread")))]
@@ -539,89 +435,6 @@ mod test {
                 readiness == 1024 || readiness == 2048,
                 "readiness should be 1024 or 2048, got {readiness}"
             );
-        }
-    }
-
-    #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn closed_write_stream() {
-        // Run many times because the test is nondeterministic:
-        for n in 0..TEST_ITERATIONS {
-            closed_write_stream_(n).await
-        }
-    }
-    #[tracing::instrument]
-    async fn closed_write_stream_(n: usize) {
-        let (reader, writer) = simplex(1);
-        let mut writer = AsyncWriteStream::new(1024, writer);
-
-        // Drop the reader to allow the worker to transition to the closed state eventually.
-        drop(reader);
-
-        // First the api is going to report the last operation failed, then subsequently
-        // it will be reported as closed. We set this flag once we see LastOperationFailed.
-        let mut should_be_closed = false;
-
-        // Write some data to the stream to ensure we have data that cannot be flushed.
-        let chunk = Bytes::from_static(&[0; 1]);
-        writer
-            .write(chunk.clone())
-            .expect("first write should succeed");
-
-        // The rest of this test should be valid whether or not we check write readiness:
-        let mut write_ready_res = None;
-        if n % 2 == 0 {
-            let r = resolves_immediately(writer.write_ready()).await;
-            // Check write readiness:
-            match r {
-                // worker hasn't processed write yet:
-                Ok(1023) => {}
-                // worker reports failure:
-                Err(StreamError::LastOperationFailed(_)) => {
-                    tracing::debug!("discovered stream failure in first write_ready");
-                    should_be_closed = true;
-                }
-                r => panic!("unexpected write_ready: {r:?}"),
-            }
-            write_ready_res = Some(r);
-        }
-
-        // When we drop the simplex reader, that causes the simplex writer to return BrokenPipe on
-        // its write. Now that the buffering crank has turned, our next write will give BrokenPipe.
-        let flush_res = writer.flush();
-        match flush_res {
-            // worker reports failure:
-            Err(StreamError::LastOperationFailed(_)) => {
-                tracing::debug!("discovered stream failure trying to flush");
-                assert!(!should_be_closed);
-                should_be_closed = true;
-            }
-            // Already reported failure, now closed
-            Err(StreamError::Closed) => {
-                assert!(
-                    should_be_closed,
-                    "expected a LastOperationFailed before we see Closed. {write_ready_res:?}"
-                );
-            }
-            // Also possible the worker hasn't processed write yet:
-            Ok(()) => {}
-            Err(e) => panic!("unexpected flush error: {e:?} {write_ready_res:?}"),
-        }
-
-        // Waiting for the flush to complete should always indicate that the channel has been
-        // closed.
-        match resolves_immediately(writer.write_ready()).await {
-            // worker reports failure:
-            Err(StreamError::LastOperationFailed(_)) => {
-                tracing::debug!("discovered stream failure trying to flush");
-                assert!(!should_be_closed);
-            }
-            // Already reported failure, now closed
-            Err(StreamError::Closed) => {
-                assert!(should_be_closed);
-            }
-            r => {
-                panic!("stream should be reported closed by the end of write_ready after flush, got {r:?}. {write_ready_res:?} {flush_res:?}")
-            }
         }
     }
 

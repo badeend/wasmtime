@@ -66,12 +66,6 @@ fn test_tcp_output_stream_should_be_closed_by_local_shutdown(
 
         // Stream should be closed:
         assert!(matches!(
-            client.output.write(message),
-            Err(StreamError::Closed)
-        ));
-
-        // The stream should remain closed:
-        assert!(matches!(
             client.output.check_write(),
             Err(StreamError::Closed)
         ));

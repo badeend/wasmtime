@@ -72,27 +72,17 @@
 #![doc(test(attr(allow(dead_code, unused_variables, unused_mut))))]
 
 use anyhow::Result;
-use bytes::Bytes;
 use rustls::pki_types::ServerName;
 use std::io;
 use std::sync::Arc;
-use std::task::{ready, Poll};
 use std::{future::Future, mem, pin::Pin, sync::LazyLock};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Mutex;
-use tokio_rustls::client::TlsStream;
 use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::pipe::AsyncReadStream;
-use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
-use wasmtime_wasi::OutputStream;
+use wasmtime_wasi::pipe::{
+    AsyncReadStream, InputStreamReader, OutputStreamReader, SharedAsyncWriteStream,
+    SharedAsyncWriteStreamHandle,
+};
 use wasmtime_wasi::{
-    async_trait,
-    bindings::io::{
-        error::Error as HostIoError,
-        poll::Pollable as HostPollable,
-        streams::{InputStream as BoxInputStream, OutputStream as BoxOutputStream},
-    },
-    Pollable, StreamError,
+    async_trait, DynInputStream, DynOutputStream, DynPollable, IoError, Pollable, StreamError,
 };
 
 mod gen_ {
@@ -126,6 +116,9 @@ fn default_client_config() -> Arc<rustls::ClientConfig> {
     });
     Arc::clone(&CONFIG)
 }
+
+const MAX_READ: usize = 1024 * 1024;
+const MAX_WRITE: usize = 1024 * 1024;
 
 /// Wasi TLS context needed fro internal `wasi-tls`` state
 pub struct WasiTlsCtx<'a> {
@@ -176,7 +169,7 @@ impl From<io::Error> for TlsError {
     fn from(error: io::Error) -> Self {
         // Report unexpected EOFs as an error to prevent truncation attacks.
         // See: https://docs.rs/rustls/latest/rustls/struct.Reader.html#method.read
-        if let io::ErrorKind::WriteZero | io::ErrorKind::UnexpectedEof = error.kind() {
+        if let io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof = error.kind() {
             return Self::msg("underlying transport closed abruptly");
         }
 
@@ -201,27 +194,31 @@ impl From<io::Error> for TlsError {
     }
 }
 
+type Transport =
+    tokio::io::Join<InputStreamReader<DynInputStream>, OutputStreamReader<DynOutputStream>>;
+type ClientTlsStream = tokio_rustls::client::TlsStream<Transport>;
+
 ///  Represents the ClientHandshake which will be used to configure the handshake
 pub struct ClientHandShake {
     server_name: String,
-    streams: WasiStreams,
+    transport: Transport,
 }
 
 impl<'a> generated::types::HostClientHandshake for WasiTlsCtx<'a> {
     fn new(
         &mut self,
         server_name: String,
-        input: Resource<BoxInputStream>,
-        output: Resource<BoxOutputStream>,
+        input: Resource<DynInputStream>,
+        output: Resource<DynOutputStream>,
     ) -> wasmtime::Result<Resource<ClientHandShake>> {
         let input = self.table.delete(input)?;
         let output = self.table.delete(output)?;
         Ok(self.table.push(ClientHandShake {
             server_name,
-            streams: WasiStreams {
-                input: StreamState::Ready(input),
-                output: StreamState::Ready(output),
-            },
+            transport: tokio::io::join(
+                InputStreamReader::new(input),
+                OutputStreamReader::new(output),
+            ),
         })?)
     }
 
@@ -231,16 +228,16 @@ impl<'a> generated::types::HostClientHandshake for WasiTlsCtx<'a> {
     ) -> wasmtime::Result<Resource<FutureClientStreams>> {
         let handshake = self.table.delete(this)?;
         let server_name = handshake.server_name;
-        let streams = handshake.streams;
+        let transport = handshake.transport;
 
         Ok(self
             .table
-            .push(FutureStreams(StreamState::Pending(Box::pin(async move {
+            .push(FutureStreams(FutureState::Pending(Box::pin(async move {
                 let domain = ServerName::try_from(server_name)
                     .map_err(|_| TlsError::msg("invalid server name"))?;
 
                 let stream = tokio_rustls::TlsConnector::from(default_client_config())
-                    .connect(domain, streams)
+                    .connect(domain, transport)
                     .await?;
                 Ok(stream)
             }))))?)
@@ -255,19 +252,25 @@ impl<'a> generated::types::HostClientHandshake for WasiTlsCtx<'a> {
     }
 }
 
+enum FutureState<T> {
+    Pending(Pin<Box<dyn Future<Output = T> + Send>>),
+    Ready(T),
+    Consumed,
+}
+
 /// Future streams provides the tls streams after the handshake is completed
-pub struct FutureStreams<T>(StreamState<Result<T, TlsError>>);
+pub struct FutureStreams<T>(FutureState<Result<T, TlsError>>);
 
 /// Library specific version of TLS connection after the handshake is completed.
 /// This alias allows it to use with wit-bindgen component generator which won't take generic types
-pub type FutureClientStreams = FutureStreams<TlsStream<WasiStreams>>;
+pub type FutureClientStreams = FutureStreams<ClientTlsStream>;
 
 #[async_trait]
 impl<T: Send + 'static> Pollable for FutureStreams<T> {
     async fn ready(&mut self) {
         match &mut self.0 {
-            StreamState::Ready(_) | StreamState::Closed => return,
-            StreamState::Pending(task) => self.0 = StreamState::Ready(task.as_mut().await),
+            FutureState::Ready(_) | FutureState::Consumed => return,
+            FutureState::Pending(task) => self.0 = FutureState::Ready(task.as_mut().await),
         }
     }
 }
@@ -276,7 +279,7 @@ impl<'a> generated::types::HostFutureClientStreams for WasiTlsCtx<'a> {
     fn subscribe(
         &mut self,
         this: wasmtime::component::Resource<FutureClientStreams>,
-    ) -> wasmtime::Result<Resource<HostPollable>> {
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         wasmtime_wasi::subscribe(self.table, this)
     }
 
@@ -289,10 +292,10 @@ impl<'a> generated::types::HostFutureClientStreams for WasiTlsCtx<'a> {
                 Result<
                     (
                         Resource<ClientConnection>,
-                        Resource<BoxInputStream>,
-                        Resource<BoxOutputStream>,
+                        Resource<DynInputStream>,
+                        Resource<DynOutputStream>,
                     ),
-                    Resource<HostIoError>,
+                    Resource<IoError>,
                 >,
                 (),
             >,
@@ -300,12 +303,12 @@ impl<'a> generated::types::HostFutureClientStreams for WasiTlsCtx<'a> {
     > {
         let this = &mut self.table.get_mut(&this)?.0;
         match this {
-            StreamState::Pending(_) => return Ok(None),
-            StreamState::Closed => return Ok(Some(Err(()))),
-            StreamState::Ready(_) => (),
+            FutureState::Pending(_) => return Ok(None),
+            FutureState::Consumed => return Ok(Some(Err(()))),
+            FutureState::Ready(_) => (),
         }
 
-        let StreamState::Ready(result) = mem::replace(this, StreamState::Closed) else {
+        let FutureState::Ready(result) = mem::replace(this, FutureState::Consumed) else {
             unreachable!()
         };
 
@@ -323,13 +326,14 @@ impl<'a> generated::types::HostFutureClientStreams for WasiTlsCtx<'a> {
         };
 
         let (rx, tx) = tokio::io::split(tls_stream);
-        let write_stream = AsyncTlsWriteStream::new(TlsWriter::new(tx));
-        let client = ClientConnection {
-            writer: write_stream.clone(),
-        };
 
-        let input = Box::new(AsyncReadStream::new(rx)) as BoxInputStream;
-        let output = Box::new(write_stream) as BoxOutputStream;
+        let input = AsyncReadStream::new(MAX_READ, rx);
+        let output = SharedAsyncWriteStream::new(MAX_WRITE, tx);
+        let client = ClientConnection {
+            writer: output.handle(),
+        };
+        let input: DynInputStream = Box::new(input);
+        let output: DynOutputStream = Box::new(output);
 
         let client = self.table.push(client)?;
         let input = self.table.push_child(input, &client)?;
@@ -349,325 +353,19 @@ impl<'a> generated::types::HostFutureClientStreams for WasiTlsCtx<'a> {
 
 /// Represents the client connection and used to shut down the tls stream
 pub struct ClientConnection {
-    writer: AsyncTlsWriteStream,
+    writer: SharedAsyncWriteStreamHandle<tokio::io::WriteHalf<ClientTlsStream>>,
 }
 
 impl<'a> generated::types::HostClientConnection for WasiTlsCtx<'a> {
     fn close_output(&mut self, this: Resource<ClientConnection>) -> wasmtime::Result<()> {
-        self.table.get_mut(&this)?.writer.close()
+        _ = self.table.get_mut(&this)?.writer.shutdown();
+        Ok(())
     }
 
     fn drop(&mut self, this: Resource<ClientConnection>) -> wasmtime::Result<()> {
         self.table.delete(this)?;
         Ok(())
     }
-}
-
-enum StreamState<T> {
-    Ready(T),
-    Pending(Pin<Box<dyn Future<Output = T> + Send>>),
-    Closed,
-}
-
-/// Wrapper around Input and Output wasi IO Stream that provides Async Read/Write
-pub struct WasiStreams {
-    input: StreamState<BoxInputStream>,
-    output: StreamState<BoxOutputStream>,
-}
-
-impl AsyncWrite for WasiStreams {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
-        loop {
-            match &mut self.as_mut().output {
-                StreamState::Closed => unreachable!(),
-                StreamState::Pending(future) => {
-                    let value = ready!(future.as_mut().poll(cx));
-                    self.as_mut().output = StreamState::Ready(value);
-                }
-                StreamState::Ready(output) => {
-                    match output.check_write() {
-                        Ok(0) => {
-                            let StreamState::Ready(mut output) =
-                                mem::replace(&mut self.as_mut().output, StreamState::Closed)
-                            else {
-                                unreachable!()
-                            };
-                            self.as_mut().output = StreamState::Pending(Box::pin(async move {
-                                output.ready().await;
-                                output
-                            }));
-                        }
-                        Ok(count) => {
-                            let count = count.min(buf.len());
-                            return match output.write(Bytes::copy_from_slice(&buf[..count])) {
-                                Ok(()) => Poll::Ready(Ok(count)),
-                                Err(StreamError::Closed) => Poll::Ready(Ok(0)),
-                                Err(e) => Poll::Ready(Err(std::io::Error::other(e))),
-                            };
-                        }
-                        Err(StreamError::Closed) => {
-                            // Our current version of tokio-rustls does not handle returning `Ok(0)` well.
-                            // See: https://github.com/rustls/tokio-rustls/issues/92
-                            return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
-                        }
-                        Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
-                    };
-                }
-            }
-        }
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        self.poll_write(cx, &[]).map(|v| v.map(drop))
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        self.poll_flush(cx)
-    }
-}
-
-impl AsyncRead for WasiStreams {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        loop {
-            let stream = match &mut self.input {
-                StreamState::Ready(stream) => stream,
-                StreamState::Pending(fut) => {
-                    let stream = ready!(fut.as_mut().poll(cx));
-                    self.input = StreamState::Ready(stream);
-                    if let StreamState::Ready(stream) = &mut self.input {
-                        stream
-                    } else {
-                        unreachable!()
-                    }
-                }
-                StreamState::Closed => {
-                    return Poll::Ready(Ok(()));
-                }
-            };
-            match stream.read(buf.remaining()) {
-                Ok(bytes) if bytes.is_empty() => {
-                    let StreamState::Ready(mut stream) =
-                        std::mem::replace(&mut self.input, StreamState::Closed)
-                    else {
-                        unreachable!()
-                    };
-
-                    self.input = StreamState::Pending(Box::pin(async move {
-                        stream.ready().await;
-                        stream
-                    }));
-                }
-                Ok(bytes) => {
-                    buf.put_slice(&bytes);
-
-                    return Poll::Ready(Ok(()));
-                }
-                Err(StreamError::Closed) => {
-                    self.input = StreamState::Closed;
-                    return Poll::Ready(Ok(()));
-                }
-                Err(e) => {
-                    self.input = StreamState::Closed;
-                    return Poll::Ready(Err(std::io::Error::other(e)));
-                }
-            }
-        }
-    }
-}
-
-type TlsWriteHalf = tokio::io::WriteHalf<tokio_rustls::client::TlsStream<WasiStreams>>;
-
-struct TlsWriter {
-    state: WriteState,
-}
-
-enum WriteState {
-    Ready(TlsWriteHalf),
-    Writing(AbortOnDropJoinHandle<io::Result<TlsWriteHalf>>),
-    Closing(AbortOnDropJoinHandle<io::Result<()>>),
-    Closed,
-    Error(io::Error),
-}
-const READY_SIZE: usize = 1024 * 1024 * 1024;
-
-impl TlsWriter {
-    fn new(stream: TlsWriteHalf) -> Self {
-        Self {
-            state: WriteState::Ready(stream),
-        }
-    }
-
-    fn write(&mut self, mut bytes: bytes::Bytes) -> Result<(), StreamError> {
-        let WriteState::Ready(_) = self.state else {
-            return Err(StreamError::Trap(anyhow::anyhow!(
-                "unpermitted: must call check_write first"
-            )));
-        };
-
-        if bytes.is_empty() {
-            return Ok(());
-        }
-
-        let WriteState::Ready(mut stream) = std::mem::replace(&mut self.state, WriteState::Closed)
-        else {
-            unreachable!()
-        };
-
-        self.state = WriteState::Writing(wasmtime_wasi::runtime::spawn(async move {
-            while !bytes.is_empty() {
-                match stream.write(&bytes).await {
-                    Ok(n) => {
-                        let _ = bytes.split_to(n);
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
-            Ok(stream)
-        }));
-
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<(), StreamError> {
-        // `flush` is a no-op here, as we're not managing any internal buffer.
-        match self.state {
-            WriteState::Ready(_)
-            | WriteState::Writing(_)
-            | WriteState::Closing(_)
-            | WriteState::Error(_) => Ok(()),
-            WriteState::Closed => Err(StreamError::Closed),
-        }
-    }
-
-    fn check_write(&mut self) -> Result<usize, StreamError> {
-        match &mut self.state {
-            WriteState::Ready(_) => Ok(READY_SIZE),
-            WriteState::Writing(_) => Ok(0),
-            WriteState::Closing(_) => Ok(0),
-            WriteState::Closed => Err(StreamError::Closed),
-            WriteState::Error(_) => {
-                let WriteState::Error(e) = std::mem::replace(&mut self.state, WriteState::Closed)
-                else {
-                    unreachable!()
-                };
-
-                Err(StreamError::LastOperationFailed(e.into()))
-            }
-        }
-    }
-
-    fn close(&mut self) {
-        match std::mem::replace(&mut self.state, WriteState::Closed) {
-            // No write in progress, immediately shut down:
-            WriteState::Ready(mut stream) => {
-                self.state = WriteState::Closing(wasmtime_wasi::runtime::spawn(async move {
-                    stream.shutdown().await
-                }));
-            }
-
-            // Schedule the shutdown after the current write has finished:
-            WriteState::Writing(write) => {
-                self.state = WriteState::Closing(wasmtime_wasi::runtime::spawn(async move {
-                    let mut stream = write.await?;
-                    stream.shutdown().await
-                }));
-            }
-
-            WriteState::Closing(t) => {
-                self.state = WriteState::Closing(t);
-            }
-            WriteState::Closed | WriteState::Error(_) => {}
-        }
-    }
-
-    async fn cancel(&mut self) {
-        match std::mem::replace(&mut self.state, WriteState::Closed) {
-            WriteState::Writing(task) => _ = task.cancel().await,
-            WriteState::Closing(task) => _ = task.cancel().await,
-            _ => {}
-        }
-    }
-
-    async fn ready(&mut self) {
-        match &mut self.state {
-            WriteState::Writing(task) => {
-                self.state = match task.await {
-                    Ok(s) => WriteState::Ready(s),
-                    Err(e) => WriteState::Error(e),
-                }
-            }
-            WriteState::Closing(task) => {
-                self.state = match task.await {
-                    Ok(()) => WriteState::Closed,
-                    Err(e) => WriteState::Error(e),
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-#[derive(Clone)]
-struct AsyncTlsWriteStream(Arc<Mutex<TlsWriter>>);
-
-impl AsyncTlsWriteStream {
-    fn new(writer: TlsWriter) -> Self {
-        AsyncTlsWriteStream(Arc::new(Mutex::new(writer)))
-    }
-
-    fn close(&mut self) -> wasmtime::Result<()> {
-        try_lock_for_stream(&self.0)?.close();
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl OutputStream for AsyncTlsWriteStream {
-    fn write(&mut self, bytes: bytes::Bytes) -> Result<(), StreamError> {
-        try_lock_for_stream(&self.0)?.write(bytes)
-    }
-
-    fn flush(&mut self) -> Result<(), StreamError> {
-        try_lock_for_stream(&self.0)?.flush()
-    }
-
-    fn check_write(&mut self) -> Result<usize, StreamError> {
-        try_lock_for_stream(&self.0)?.check_write()
-    }
-
-    async fn cancel(&mut self) {
-        self.0.lock().await.cancel().await
-    }
-}
-
-#[async_trait]
-impl Pollable for AsyncTlsWriteStream {
-    async fn ready(&mut self) {
-        self.0.lock().await.ready().await
-    }
-}
-
-fn try_lock_for_stream<TlsWriter>(
-    mutex: &Mutex<TlsWriter>,
-) -> Result<tokio::sync::MutexGuard<'_, TlsWriter>, StreamError> {
-    mutex
-        .try_lock()
-        .map_err(|_| StreamError::trap("concurrent access to resource not supported"))
 }
 
 #[cfg(test)]
@@ -679,7 +377,7 @@ mod tests {
     async fn test_future_client_streams_ready_can_be_canceled() {
         let (tx1, rx1) = oneshot::channel::<()>();
 
-        let mut future_streams = FutureStreams(StreamState::Pending(Box::pin(async move {
+        let mut future_streams = FutureStreams(FutureState::Pending(Box::pin(async move {
             rx1.await
                 .map_err(|_| TlsError::Trap(anyhow::anyhow!("oneshot canceled")))
         })));
@@ -693,7 +391,7 @@ mod tests {
         drop(fut);
 
         match future_streams.0 {
-            StreamState::Closed => panic!("First future should be in Pending/ready state"),
+            FutureState::Consumed => panic!("First future should be in Pending/ready state"),
             _ => (),
         }
 
@@ -702,7 +400,7 @@ mod tests {
         future_streams.ready().await;
 
         match future_streams.0 {
-            StreamState::Ready(Ok(())) => (),
+            FutureState::Ready(Ok(())) => (),
             _ => panic!("First future should be in Ready(Err) state"),
         }
     }
