@@ -45,27 +45,34 @@ fn test_tcp_connect_wrong_family(net: &Network, family: IpAddressFamily) {
 }
 
 /// Can only connect to unicast addresses.
-fn test_tcp_connect_non_unicast(net: &Network) {
+fn test_tcp_connect_ipv4_broadcast(net: &Network) {
     let ipv4_broadcast = IpSocketAddress::new(IpAddress::IPV4_BROADCAST, SOME_PORT);
+    let sock = TcpSocket::new(IpAddressFamily::Ipv4).unwrap();
+    assert_eq!(
+        sock.blocking_connect(net, ipv4_broadcast).unwrap_err(),
+        ErrorCode::RemoteUnreachable
+    );
+}
+
+/// Can only connect to unicast addresses.
+fn test_tcp_connect_ipv4_multicast(net: &Network) {
     let ipv4_multicast = IpSocketAddress::new(IpAddress::Ipv4((224, 254, 0, 0)), SOME_PORT);
+    let sock = TcpSocket::new(IpAddressFamily::Ipv4).unwrap();
+    assert_eq!(
+        sock.blocking_connect(net, ipv4_multicast).unwrap_err(),
+        ErrorCode::RemoteUnreachable
+    );
+}
+
+/// Can only connect to unicast addresses.
+fn test_tcp_connect_ipv6_multicast(net: &Network) {
     let ipv6_multicast =
         IpSocketAddress::new(IpAddress::Ipv6((0xff00, 0, 0, 0, 0, 0, 0, 0)), SOME_PORT);
-
-    let sock_v4 = TcpSocket::new(IpAddressFamily::Ipv4).unwrap();
-    let sock_v6 = TcpSocket::new(IpAddressFamily::Ipv6).unwrap();
-
-    assert!(matches!(
-        sock_v4.blocking_connect(net, ipv4_broadcast),
-        Err(ErrorCode::InvalidArgument)
-    ));
-    assert!(matches!(
-        sock_v4.blocking_connect(net, ipv4_multicast),
-        Err(ErrorCode::InvalidArgument)
-    ));
-    assert!(matches!(
-        sock_v6.blocking_connect(net, ipv6_multicast),
-        Err(ErrorCode::InvalidArgument)
-    ));
+    let sock = TcpSocket::new(IpAddressFamily::Ipv6).unwrap();
+    assert_eq!(
+        sock.blocking_connect(net, ipv6_multicast).unwrap_err(),
+        ErrorCode::RemoteUnreachable
+    );
 }
 
 fn test_tcp_connect_dual_stack(net: &Network) {
@@ -126,14 +133,15 @@ fn main() {
     test_tcp_connect_unspec(&net, IpAddressFamily::Ipv4);
     test_tcp_connect_port_0(&net, IpAddressFamily::Ipv4);
     test_tcp_connect_wrong_family(&net, IpAddressFamily::Ipv4);
+    test_tcp_connect_ipv4_broadcast(&net);
+    test_tcp_connect_ipv4_multicast(&net);
     test_tcp_connect_explicit_bind(&net, IpAddressFamily::Ipv4);
 
     if supports_ipv6() {
         test_tcp_connect_unspec(&net, IpAddressFamily::Ipv6);
         test_tcp_connect_port_0(&net, IpAddressFamily::Ipv6);
         test_tcp_connect_wrong_family(&net, IpAddressFamily::Ipv6);
-        test_tcp_connect_non_unicast(&net);
-
+        test_tcp_connect_ipv6_multicast(&net);
         test_tcp_connect_dual_stack(&net);
         test_tcp_connect_explicit_bind(&net, IpAddressFamily::Ipv6);
     }

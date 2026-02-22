@@ -120,18 +120,18 @@ fn test_tcp_bind_non_unicast(net: &Network) {
     let sock_v4 = TcpSocket::new(IpAddressFamily::Ipv4).unwrap();
     let sock_v6 = TcpSocket::new(IpAddressFamily::Ipv6).unwrap();
 
-    assert!(matches!(
-        sock_v4.blocking_bind(net, ipv4_broadcast),
-        Err(ErrorCode::InvalidArgument)
-    ));
-    assert!(matches!(
-        sock_v4.blocking_bind(net, ipv4_multicast),
-        Err(ErrorCode::InvalidArgument)
-    ));
-    assert!(matches!(
-        sock_v6.blocking_bind(net, ipv6_multicast),
-        Err(ErrorCode::InvalidArgument)
-    ));
+    assert_eq!(
+        sock_v4.blocking_bind(net, ipv4_broadcast).unwrap_err(),
+        ErrorCode::AddressNotBindable
+    );
+    assert_eq!(
+        sock_v4.blocking_bind(net, ipv4_multicast).unwrap_err(),
+        ErrorCode::AddressNotBindable
+    );
+    assert_eq!(
+        sock_v6.blocking_bind(net, ipv6_multicast).unwrap_err(),
+        ErrorCode::AddressNotBindable
+    );
 }
 
 fn test_tcp_bind_dual_stack(net: &Network) {

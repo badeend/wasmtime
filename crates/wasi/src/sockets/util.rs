@@ -64,10 +64,11 @@ pub fn is_valid_remote_address(addr: SocketAddr) -> bool {
 }
 
 pub fn is_valid_unicast_address(addr: IpAddr) -> bool {
-    match addr.to_canonical() {
-        IpAddr::V4(ipv4) => !ipv4.is_multicast() && !ipv4.is_broadcast(),
-        IpAddr::V6(ipv6) => !ipv6.is_multicast(),
-    }
+    true
+    // match addr.to_canonical() {
+    //     IpAddr::V4(ipv4) => !ipv4.is_multicast() && !ipv4.is_broadcast(),
+    //     IpAddr::V6(ipv6) => !ipv6.is_multicast(),
+    // }
 }
 
 pub fn to_ipv4_addr(addr: (u8, u8, u8, u8)) -> Ipv4Addr {
